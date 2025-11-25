@@ -149,7 +149,15 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate, LocalPr
     open func rangeChanged(source: TerminalView, startY: Int, endY: Int) {
         //
     }
-    
+
+    /**
+     * Called when iTerm2-style OSC 1337 sequences are received.
+     * Override this method to handle custom OSC 1337 content.
+     */
+    open func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {
+        // Default implementation does nothing
+    }
+
     /**
      * Launches a child process inside a pseudo-terminal.
      * - Parameter executable: The executable to launch inside the pseudo terminal, defaults to /bin/bash
