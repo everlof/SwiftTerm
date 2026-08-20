@@ -15,6 +15,85 @@ import AppKit
 import CoreText
 import CoreGraphics
 
+/// The spelling a program used for one colour after terminal rendering semantics such as
+/// inverse video and bold-as-bright have been applied.
+public enum TerminalRenderedColorSource: Hashable, Sendable {
+    case ansi256(index: UInt8)
+    case trueColor(red: UInt8, green: UInt8, blue: UInt8)
+    case defaultForeground
+    case defaultBackground
+    case invertedDefaultForeground
+    case invertedDefaultBackground
+}
+
+/// A colour reduced to the stable sRGB bytes a diagnostic can safely carry out of the renderer.
+public struct TerminalRenderedColor: Hashable, Sendable {
+    public let red: UInt8
+    public let green: UInt8
+    public let blue: UInt8
+
+    public init(red: UInt8, green: UInt8, blue: UInt8) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+}
+
+/// A visible run of meaningful text whose final foreground and background are effectively the
+/// same. SwiftTerm still draws the colours exactly as the program requested; this is observation,
+/// never correction.
+public struct TerminalTextColorConflict: Hashable, Sendable {
+    public let foregroundSource: TerminalRenderedColorSource
+    public let backgroundSource: TerminalRenderedColorSource
+    public let foreground: TerminalRenderedColor
+    public let background: TerminalRenderedColor
+    public let contrastRatio: Double
+
+    /// What the run actually said, so a diagnostic can quote the text the reader could not see.
+    /// Program output is external content: this is already stripped of control characters,
+    /// collapsed to single spaces and capped at a few words, and it is empty when nothing
+    /// quotable survived that.
+    public let sample: String
+
+    public init(
+        foregroundSource: TerminalRenderedColorSource,
+        backgroundSource: TerminalRenderedColorSource,
+        foreground: TerminalRenderedColor,
+        background: TerminalRenderedColor,
+        contrastRatio: Double,
+        sample: String = ""
+    ) {
+        self.foregroundSource = foregroundSource
+        self.backgroundSource = backgroundSource
+        self.foreground = foreground
+        self.background = background
+        self.contrastRatio = contrastRatio
+        self.sample = sample
+    }
+}
+
+/// Bounds on the text a colour conflict is allowed to carry out of the renderer.
+public enum TerminalContrastSample {
+    /// Scanned scalars, which is what stops a full-width run from being walked twice.
+    public static let scanLimit = 64
+
+    /// Kept characters. A few words is enough to point at the place on screen; a whole line
+    /// would not fit the band that shows it, and would be truncated there instead — by a
+    /// component that cannot say *why* it truncated.
+    public static let characterLimit = 24
+
+    /// Appended when either bound cut the run short, so a quoted fragment never claims to be
+    /// the whole of what the program printed.
+    public static let ellipsis: Character = "…"
+}
+
+struct TerminalTextContrastPair: Hashable {
+    let foregroundSource: TerminalRenderedColorSource
+    let backgroundSource: TerminalRenderedColorSource
+    let foreground: TerminalRenderedColor
+    let background: TerminalRenderedColor
+}
+
 /**
  * TerminalView provides an AppKit front-end to the `Terminal` termininal emulator.
  * It is up to a subclass to either wire the terminal emulator to a remote terminal
@@ -74,7 +153,28 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
      * The delegate that the TerminalView uses to interact with its hosting
      */
     public weak var terminalDelegate: TerminalViewDelegate?
-    
+
+    /**
+     * Gives a subclass a chance to keep the emulator on an explicitly managed grid, one that
+     * does not follow this view's pixel size.
+     *
+     * Called before the emulator is touched, so returning false suppresses the whole of the
+     * frame-driven resize: no reflow of the buffer, no soft reset, and no delegate
+     * notification. The default preserves SwiftTerm behaviour.
+     */
+    open func shouldApplyFrameSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
+    /**
+     * Gives a subclass a chance to keep a programmatic emulator resize local to the renderer.
+     * Internal scrolling and accessibility state are still updated; only the host delegate
+     * notification is suppressed. The default preserves SwiftTerm behaviour.
+     */
+    open func shouldReportSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
     /// If true, the caret view will show different shapes depending on the focus
     /// otherwise, it will behave like it is focused
     public var caretViewTracksFocus: Bool {
@@ -96,6 +196,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public var terminal: Terminal!
 
     var selection: SelectionService!
+    /// The scrollback origin when the current selection was last changed. Buffer coordinates
+    /// remain stable while normal scrollback grows, but recycling its oldest line shifts every
+    /// coordinate and invalidates the range.
+    private var selectionLinesTop = 0
     private var scroller: NSScroller!
     
     // Attribute dictionary, maps a console attribute (color, flags) to the corresponding dictionary
@@ -107,6 +211,44 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // Cache for the colors in the 0..255 range
     var colors: [NSColor?] = Array(repeating: nil, count: 256)
     var trueColors: [Attribute.Color:NSColor] = [:]
+
+    /// Backgrounds cached *after* `trueColorBackgroundTransform` has run.
+    ///
+    /// Separate from `trueColors` because that cache is keyed by the colour alone, while the
+    /// transform applies to one role only — sharing it would hand a rewritten background back
+    /// to a foreground asking for the same 24-bit value.
+    var trueColorBackgrounds: [Attribute.Color:NSColor] = [:]
+
+    /// Rewrites a 24-bit **background** colour on its way to the screen.
+    ///
+    /// A program emitting `48;2;R;G;B` has picked an absolute colour for a generic terminal and
+    /// cannot know what palette it landed in, so a themed host has no say in the one place a
+    /// large flat area of colour appears. This is that say. Foregrounds are deliberately not
+    /// offered: a program's syntax highlighting is its own, and rewriting text colour against a
+    /// background the program also chose is how legibility gets broken from the outside.
+    ///
+    /// Indexed colours (`ansi256`) are already the palette's and never reach this.
+    public var trueColorBackgroundTransform: ((NSColor) -> NSColor)? {
+        didSet {
+            trueColorBackgrounds = [:]
+            colorsChanged()
+        }
+    }
+
+    /// Reports severe final text/background collisions found while building visible rows.
+    ///
+    /// The renderer performs the qualification and deduplication itself so a host does not get
+    /// a callback for every token or frame. Setting this never changes terminal output.
+    public var onLowContrastText: ((TerminalTextColorConflict) -> Void)?
+
+    /// Colour pairs already measured for the current palette. Both collections are bounded:
+    /// programs can emit arbitrary truecolour values, and a diagnostic cache must not turn that
+    /// external cardinality into permanent renderer memory.
+    var evaluatedTextContrast: Set<TerminalTextContrastPair> = []
+    /// Keyed by the colour pair rather than by the reported conflict: the conflict now carries a
+    /// sample of the text that produced it, and a program printing a second unreadable word must
+    /// not read as a second collision.
+    var reportedTextContrast: Set<TerminalTextContrastPair> = []
     var transparent = TTColor.transparent ()
     var isBigSur = true
     
@@ -167,6 +309,19 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         setupScroller()
         setupOptions()
         setupFocusNotification()
+        updateLayerContentsScale()
+    }
+
+    /// Updates the layer's contentsScale to match the display for crisp HiDPI rendering.
+    func updateLayerContentsScale() {
+        layer?.contentsScale = backingScaleFactor()
+    }
+
+    override open func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        updateLayerContentsScale()
+        // Trigger redraw at new scale
+        needsDisplay = true
     }
     
     func startDisplayUpdates ()
@@ -211,6 +366,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     var _nativeFg, _nativeBg: TTColor!
     var settingFg = false, settingBg = false
+    var _nativeBoldFg: NSColor?
     /**
      * This will set the native foreground color to the specified native color (UIColor or NSColor)
      * and will have this reflected into the underlying's terminal `foregroundColor` and
@@ -224,6 +380,31 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             _nativeFg = newValue
             terminal.foregroundColor = nativeForegroundColor.getTerminalColor ()
             settingFg = false
+            evaluatedTextContrast.removeAll(keepingCapacity: true)
+            reportedTextContrast.removeAll(keepingCapacity: true)
+        }
+    }
+
+    /// **Ours.** The colour bold text drawn with the *default* foreground is rendered in —
+    /// Terminal.app's "Bold Text" — or nil to draw it in `nativeForegroundColor`, which is what
+    /// SwiftTerm did before this existed.
+    ///
+    /// Bold text that names an ANSI colour is unaffected: it keeps the 0–7 to 8–15 bright shift.
+    /// This is not pushed into the terminal engine, because no escape sequence describes it; it
+    /// is a property of the palette the host installed.
+    public var nativeBoldForegroundColor: NSColor? {
+        get { _nativeBoldFg }
+        set {
+            guard _nativeBoldFg != newValue else { return }
+            _nativeBoldFg = newValue
+            // Attributes are cached per `Attribute`, and the bold styles among them resolved
+            // through the old answer — so the cache is stale in exactly the cells this moves.
+            attributes = [:]
+            urlAttributes = [:]
+            evaluatedTextContrast = []
+            reportedTextContrast = []
+            terminal.updateFullScreen ()
+            queuePendingDisplay ()
         }
     }
 
@@ -240,6 +421,8 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             _nativeBg = newValue
             terminal.backgroundColor = nativeBackgroundColor.getTerminalColor ()
             settingBg = false
+            evaluatedTextContrast.removeAll(keepingCapacity: true)
+            reportedTextContrast.removeAll(keepingCapacity: true)
         }
     }
     
@@ -257,6 +440,15 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     public var caretTextColor: NSColor? {
         get { caretView.caretTextColor }
         set { caretView.caretTextColor = newValue }
+    }
+
+    /// Controls the cursor style (block, underline, bar) and whether it blinks
+    public var cursorStyle: CursorStyle {
+        get { caretView.style }
+        set {
+            caretView.style = newValue
+            terminal.options.cursorStyle = newValue
+        }
     }
 
     var _selectedTextBackgroundColor = NSColor.selectedTextBackgroundColor
@@ -287,16 +479,18 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             scroller.doubleValue =  scrollPosition
         case .knob:
             scroll(toPosition: scroller.doubleValue)
-        case .knobSlot:
-            print ("Scroller .knobSlot clicked")
-        case .noPart:
-            print ("Scroller .noPart clicked")
-        case .decrementLine:
-            print ("Scroller .decrementLine clicked")
-        case .incrementLine:
-            print ("Scroller .incrementLine clicked")
+        case .knobSlot, .noPart, .decrementLine, .incrementLine:
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .uiUnhandledAction,
+                facts: ["action": Int(scroller.hitPart.rawValue)]
+            )
         default:
-            print ("Scroller: New value introduced")
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .uiUnhandledAction,
+                facts: ["action": Int(scroller.hitPart.rawValue)]
+            )
         }
     }
     
@@ -319,7 +513,29 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         scroller.action = #selector(scrollerActivated)
         scroller.target = self
     }
+
+    /// Replaces the terminal's scrollbar without replacing its scrolling behavior.
+    ///
+    /// The embedder owns application chrome while SwiftTerm owns scroll position, sizing and
+    /// actions. Supplying an `NSScroller` here is the seam between them: setup restates every
+    /// behavioral property and subsequent buffer changes continue updating the replacement.
+    public func installScroller(_ replacement: NSScroller)
+    {
+        guard replacement !== scroller else { return }
+        scroller.removeFromSuperview()
+        scroller = replacement
+        setupScroller()
+        updateScroller()
+    }
     
+    /// **Ours.** The colour this attribute's text is drawn in, after inverse, the bold
+    /// foreground, bold-as-bright and SGR 2 faintness have all resolved. A seam for the
+    /// embedder's tests; the renderer itself uses the same call.
+    public func resolvedForegroundColor (for attribute: Attribute) -> NSColor
+    {
+        resolvedForeground (for: attribute)
+    }
+
     /// This method sents the `nativeForegroundColor` and `nativeBackgroundColor`
     /// to match macOS default colors for text and its background.
     public func configureNativeColors ()
@@ -330,6 +546,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func bufferActivated(source: Terminal) {
+        // A selection belongs to one buffer. The normal and alternate buffers reuse the same
+        // coordinates for unrelated contents, so carrying a range between them highlights text
+        // the user never selected.
+        selection.selectNone()
         updateScroller ()
     }
     
@@ -351,13 +571,21 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     open func scrolled(source terminal: Terminal, yDisp: Int) {
+        // Normal-buffer growth appends beneath existing ranges, so selection remains valid.
+        // A fixed alternate buffer scrolls its rows in place, while a full normal scrollback
+        // recycles from the top; both replace the cells the saved coordinates identified.
+        if selection.active,
+           !terminal.buffer.hasScrollback || terminal.buffer.linesTop != selectionLinesTop {
+            selection.selectNone()
+        }
         //selectionView.notifyScrolled(source: terminal)
         updateScroller()
         terminalDelegate?.scrolled(source: self, position: scrollPosition)
     }
     
     open func linefeed(source: Terminal) {
-        selection.selectNone()
+        // A line feed that does not scroll or trim the buffer leaves an existing range valid.
+        // `scrolled(source:yDisp:)` owns the two cases that do invalidate its coordinates.
     }
     
     /// This vaiable controls whether mouse events are sent to the application running under the
@@ -386,12 +614,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var userScrolling = false
 
     override open func viewWillDraw() {
-        
+
         // Starting with BigSur, it looks like even sending one pixel to be redrawn will trigger
         // a call to draw() for the whole surface
         if disableFullRedrawOnAnyChanges {
             let layer = self.layer
             layer?.contentsFormat = .RGBA8Uint
+            // Ensure proper HiDPI scaling for crisp text rendering
+            layer?.contentsScale = backingScaleFactor()
         }
     }
     #if false
@@ -406,7 +636,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         NSGraphicsContext.current?.cgContext
     }
     
-    override public func draw (_ dirtyRect: NSRect) {
+    override open func draw (_ dirtyRect: NSRect) {
         guard let currentContext = getCurrentGraphicsContext() else {
             return
         }
@@ -581,7 +811,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     // doCommand/noop: - but more research needs to take place to figure out the priority
     // of those keys.
     //
-    public override func keyDown(with event: NSEvent) {
+    open override func keyDown(with event: NSEvent) {
         selection.active = false
         let eventFlags = event.modifierFlags
         
@@ -730,8 +960,21 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
             send (EscapeSequences.emacsBack)
         case #selector(moveToRightEndOfLine(_:)):
             send (EscapeSequences.emacsForward)
+        // The Option-word keys, for hosts that leave `optionAsMetaKey` off so the Option key can
+        // still compose characters (`~`, `|`, `\` on most non-US layouts). The meta branch in
+        // `keyDown` special-cases the arrows into these same sequences, but it is all-or-nothing:
+        // switching it off to keep composition working also silently dropped word editing,
+        // because AppKit resolves these keys to `moveWordLeft:`, `moveWordRight:` and
+        // `deleteWordBackward:`, and nothing below claimed them. That is the entire keypress
+        // lost — not a sequence the program misreads.
+        case #selector(moveWordLeft(_:)):
+            send (EscapeSequences.emacsBack)
+        case #selector(moveWordRight(_:)):
+            send (EscapeSequences.emacsForward)
+        case #selector(deleteWordBackward(_:)):
+            send (EscapeSequences.emacsBackwardKillWord)
         default:
-            print ("Unhandle selector \(selector)")
+            SwiftTermDiagnostics.emit(.debug, .uiUnhandledAction)
         }
     }
     
@@ -785,7 +1028,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func markedRange() -> NSRange {
-        print ("markedRange: This should return the actual range from the selection")
+        SwiftTermDiagnostics.emit(
+            .warning,
+            .uiTextInputUnsupported,
+            facts: ["operation": 1]
+        )
         
         // This means "no marked" - when we fix, we should address
         return NSRange.empty
@@ -800,7 +1047,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func attributedSubstring(forProposedRange range: NSRange, actualRange: NSRangePointer?) -> NSAttributedString? {
-        print ("Attribuetd string")
+        SwiftTermDiagnostics.emit(
+            .warning,
+            .uiTextInputUnsupported,
+            facts: ["operation": 2]
+        )
         return nil
     }
     
@@ -823,7 +1074,11 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     // NSTextInputClient protocol implementation
     open func characterIndex(for point: NSPoint) -> Int {
-        print ("characterIndex:for point: This should return the actual range from the selection")
+        SwiftTermDiagnostics.emit(
+            .warning,
+            .uiTextInputUnsupported,
+            facts: ["operation": 3]
+        )
         return NSNotFound
     }
     
@@ -851,36 +1106,90 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         case #selector(copy(_:)):
             return selection.active
         default:
-            print ("Validating User Interface Item: \(item)")
+            SwiftTermDiagnostics.emit(.debug, .uiUnhandledAction)
             return false
         }
     }
     
     open func selectionChanged(source: Terminal) {
+        if selection.active {
+            selectionLinesTop = source.buffer.linesTop
+        }
         needsDisplay = true
     }
     
     func cut (sender: Any?) {}
     
+    /// The pasteboard `copy` and `paste` read and write.
+    ///
+    /// Ours, and it exists for the tests. `NSPasteboard.general` is the developer's own
+    /// clipboard, so a unit test that exercised copying threw away whatever they had on it —
+    /// the same trap as a hosted test writing to `UserDefaults.standard`. Defaulting to
+    /// `.general` leaves every shipping path exactly as it was.
+    public var pasteboard: NSPasteboard = .general
+
     @objc
     open func paste(_ sender: Any)
     {
-        let clipboard = NSPasteboard.general
-        let text = clipboard.string(forType: .string)
+        let text = pasteboard.string(forType: .string)
         insertText(text ?? "", replacementRange: NSRange(location: 0, length: 0), isPaste: true)
     }
-    
+
+    /// Sends `text` the way `paste` sends the clipboard: wrapped in the bracketed-paste markers
+    /// when the program has asked for them.
+    ///
+    /// Ours, and the reason is a drop. A file dragged onto a terminal is a paste that never
+    /// went through the clipboard, and the program reading the PTY tells the two apart: with
+    /// bracketed paste on, one arriving string is a paste, and the same bytes without the
+    /// markers are a burst of typing. The distinction is load-bearing for the agent CLIs — a
+    /// pasted image path becomes an attached image, a typed one stays text — and an embedder
+    /// had no way to reach it without first writing over the user's clipboard.
+    public func pasteText(_ text: String)
+    {
+        insertText(text, replacementRange: NSRange(location: 0, length: 0), isPaste: true)
+    }
+
+    /// The selected text, or nil when nothing is selected and when the selection covers no
+    /// characters at all.
+    ///
+    /// Ours. `SelectionService` is internal, so an embedder had no way to ask what — or
+    /// whether — the user had selected; the nil-for-empty half is the load-bearing one, since
+    /// `copy` clears the pasteboard before it writes and a caller that cannot tell an empty
+    /// selection from a real one wipes the clipboard on an ordinary click.
+    public var selectedText: String? {
+        guard let selection, selection.active else { return nil }
+        let text = selection.getSelectedText()
+        return text.isEmpty ? nil : text
+    }
+
+    /// Called when a **pointer gesture** has finished settling the selection: a drag released, a
+    /// double- or triple-click, a shift-click extension. Does nothing here; a host overrides it
+    /// to implement copy-on-select.
+    ///
+    /// Ours, and deliberately not `selectionChanged(source:)`: `SelectionService` posts that one
+    /// on every `dragExtend`, which is every mouse-moved event inside a drag, so a host copying
+    /// there would rewrite the pasteboard a hundred times per gesture and hand back a half-made
+    /// selection each time. Nothing calls this for `selectAll`, nor for a click whose only
+    /// effect is to clear a selection — neither is a user choosing text to take with them.
+    open func selectionGestureEnded()
+    {
+    }
+
     @objc
     open func copy(_ sender: Any)
     {
         // find the selected range of text in the buffer and put in the clipboard
-        let str = selection.getSelectedText()
-        
-        let clipboard = NSPasteboard.general
-        clipboard.clearContents()
-        clipboard.setString(str, forType: .string)
+        //
+        // The guard is ours: `clearContents` before an empty write turned a copy with nothing
+        // selected into "throw away the user's clipboard". ⌘C never reached it — the menu
+        // validation below gates on `selection.active` — but an embedder's own context menu
+        // and copy-on-select both call this directly.
+        guard let str = selectedText else { return }
+
+        pasteboard.clearContents()
+        pasteboard.setString(str, forType: .string)
     }
-    
+
     public override func selectAll(_ sender: Any?)
     {
         selectAll ()
@@ -944,32 +1253,42 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
-    public override func mouseDown(with event: NSEvent) {
+    open override func mouseDown(with event: NSEvent) {
         if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(with: event)
             return
         }
         
         let hit = calculateMouseHit(with: event).grid
-        
+
+        // Whether this click *made* a selection rather than cleared one. A drag has no say
+        // here; it settles on mouseUp.
+        var settledSelection = false
+
         switch event.clickCount {
         case 1:
             if selection.active == true {
                 if event.modifierFlags.contains(.shift) {
                     selection.shiftExtend(row: hit.row, col: hit.col)
+                    settledSelection = true
                 } else {
                     selection.active = false
                 }
             }
         case 2:
             selection.selectWordOrExpression(at: Position(col: hit.col, row: hit.row + terminal.buffer.yDisp), in: terminal.buffer)
-            
+            settledSelection = true
+
         default:
             // 3 and higher
-            
+
             selection.select(row: hit.row + terminal.buffer.yDisp)
+            settledSelection = true
         }
         setNeedsDisplay(bounds)
+        if settledSelection {
+            selectionGestureEnded()
+        }
     }
     
     func getPayload (for event: NSEvent) -> Any?
@@ -981,7 +1300,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     
     var didSelectionDrag: Bool = false
     
-    public override func mouseUp(with event: NSEvent) {
+    open override func mouseUp(with event: NSEvent) {
         if event.modifierFlags.contains(.command){
             if let payload = getPayload(for: event) as? String {
                 if let (url, params) = urlAndParamsFrom(payload: payload) {
@@ -998,11 +1317,17 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         // let hit = calculateMouseHit(with: event)
         //print ("Up at col=\(hit.col) row=\(hit.row) count=\(event.clickCount) selection.active=\(selection.active) didSelectionDrag=\(didSelectionDrag) ")
         #endif
-        
+
+        // The release is where a dragged selection is finally what the user meant, including
+        // one the autoscroll timer kept extending past the edge of the view.
+        let draggedASelection = didSelectionDrag && selection.active
         didSelectionDrag = false
+        if draggedASelection {
+            selectionGestureEnded()
+        }
     }
     
-    public override func mouseDragged(with event: NSEvent) {
+    open override func mouseDragged(with event: NSEvent) {
         let mouseHit = calculateMouseHit(with: event)
         let hit = mouseHit.grid
         if allowMouseReporting {
@@ -1102,14 +1427,14 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     /// The cell the last motion report named, so an unchanged one is not reported twice.
     var lastMotionCell: Position? = nil
 
-    public override func mouseMoved(with event: NSEvent) {
+    open override func mouseMoved(with event: NSEvent) {
         let hit = calculateMouseHit(with: event)
         if commandActive {
             if let payload = getPayload(for: event) as? String {
                 previewUrl (payload: payload)
             }
         }
-        
+
         // Motion is reported per *character cell*, not per pixel, which is the contract xterm
         // sets for modes 1002/1003 and what every client assumes. Reporting each AppKit
         // `mouseMoved` instead sent dozens of identical events per cell — trackpad jitter under
@@ -1125,16 +1450,121 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         let flags = encodeMouseEvent(with: event, overwriteRelease: true)
         terminal.sendMotion(buttonFlags: flags, x: hit.grid.col, y: hit.grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
     }
+    
+    /// Leftover precise-scroll distance not yet worth a whole line.
+    private var scrollAccumulator: CGFloat = 0
 
-    public override func scrollWheel(with event: NSEvent) {
-        if event.deltaY == 0 {
+    open override func scrollWheel(with event: NSEvent) {
+        // When the application has enabled mouse reporting, the wheel belongs to it: the
+        // event is encoded and written to the PTY — a full-screen program scrolls its own
+        // content that way (Claude Code moves its transcript, not the scrollback). Holding
+        // option falls back to scrolling the local scrollback, the escape hatch other
+        // terminals offer for the same situation.
+        if allowMouseReporting && terminal.mouseMode != .off
+            && !event.modifierFlags.contains(.option) {
+            forwardWheelEvent(event)
             return
         }
-        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
-        if event.deltaY > 0 {
-            scrollUp (lines: velocity)
+
+        guard let lines = wheelLineDelta(for: event) else { return }
+
+        if lines > 0 {
+            scrollUp(lines: lines)
         } else {
-            scrollDown(lines: velocity)
+            scrollDown(lines: -lines)
+        }
+    }
+
+    /// The whole lines a wheel event amounts to, or nil while a gesture has not yet
+    /// accumulated one.
+    ///
+    /// Trackpads and Magic Mice report precise deltas, which are fractions of a line.
+    /// Truncating those to an Int rounds almost every one of them to zero, so scrolling
+    /// collapsed to a single line per event however fast the gesture was. Accumulate the
+    /// distance instead and carry the remainder, which keeps fine scrolling and momentum
+    /// proportional to the gesture.
+    private func wheelLineDelta(for event: NSEvent) -> Int? {
+        if event.hasPreciseScrollingDeltas {
+            // A new gesture starts fresh, so leftovers cannot accumulate into a jump.
+            if event.phase == .began {
+                scrollAccumulator = 0
+            }
+
+            let lineHeight = cellDimension?.height ?? 0
+            guard lineHeight > 0 else { return nil }
+
+            scrollAccumulator += event.scrollingDeltaY
+
+            let lines = Int(scrollAccumulator / lineHeight)
+            guard lines != 0 else { return nil }
+            scrollAccumulator -= CGFloat(lines) * lineHeight
+            return lines
+        }
+
+        // A classic wheel reports whole notches, where a velocity curve reads best.
+        if event.deltaY == 0 {
+            return nil
+        }
+        let velocity = calcScrollingVelocity(delta: Int (abs (event.deltaY)))
+        return event.deltaY > 0 ? velocity : -velocity
+    }
+
+    /// The measured rate wheel reports may be written at, shared with the iOS view so the two
+    /// cannot drift apart. See `WheelReportBudget` for what a split report costs.
+    private var wheelBudget = WheelReportBudget()
+
+    /// The wheel's distance in lines *as reported to the application*.
+    ///
+    /// The scrollback path multiplies a classic notch by a velocity curve — up to a screenful
+    /// for one event — which is a scrolling nicety and the wrong count to report: one notch is
+    /// one wheel event, which is what the program expects to be told.
+    private func wheelReportLines(for event: NSEvent) -> Int? {
+        guard event.hasPreciseScrollingDeltas else {
+            guard event.deltaY != 0 else { return nil }
+            return event.deltaY > 0 ? 1 : -1
+        }
+        return wheelLineDelta(for: event)
+    }
+
+    /// Reports a wheel event to the application as mouse wheel button presses (64/65),
+    /// one per accumulated line, at the pointer's cell — and no faster than the program
+    /// on the other end reads them.
+    ///
+    /// A pty carries no message boundaries and its input queue fills a byte at a time, so a
+    /// program that is mid-render when reports arrive resumes reading in the *middle* of one. A
+    /// stdin parser that does not carry a partial escape sequence across reads then drops the
+    /// orphaned `ESC [ <` and takes the rest for typing: `65;104;33M` landing in Claude Code's
+    /// composer while scrolling is this, and nothing else. The reports themselves arrive in
+    /// order — that was measured too, and it is not where this breaks.
+    ///
+    /// Rate is the whole fix, because the split is the reader's backlog draining, not our
+    /// framing: writing a burst as one write instead of thirty made it *worse*. This gesture was
+    /// worth up to 30 reports on its own, which cleared 1000 a second on any momentum flick.
+    /// Reports past the budget are dropped rather than queued — a scroll the application never
+    /// saw is a scroll that did not happen, and the next gesture already says where the user
+    /// wants to be.
+    private func forwardWheelEvent(_ event: NSEvent) {
+        guard let lines = wheelReportLines(for: event) else { return }
+        let reports = wheelBudget.grant(min(abs(lines), Int(WheelReportBudget.burst)))
+        guard reports > 0 else { return }
+
+        let hit = calculateMouseHit(with: event)
+        let flags = terminal.encodeButton(
+            button: lines > 0 ? 4 : 5,
+            release: false,
+            shift: event.modifierFlags.contains(.shift),
+            meta: false,
+            control: event.modifierFlags.contains(.control)
+        )
+
+        for _ in 0..<reports {
+            terminal.sendEvent(
+                buttonFlags: flags,
+                x: hit.grid.col,
+                y: hit.grid.row,
+                pixelX: hit.pixels.col,
+                pixelY: hit.pixels.row
+            )
         }
     }
     
@@ -1245,7 +1675,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     }
     
     public func sizeChanged(source: Terminal) {
-        terminalDelegate?.sizeChanged(source: self, newCols: source.cols, newRows: source.rows)
+        if shouldReportSizeChange(newCols: source.cols, newRows: source.rows) {
+            terminalDelegate?.sizeChanged(source: self, newCols: source.cols, newRows: source.rows)
+        }
         updateScroller ()
     }
     

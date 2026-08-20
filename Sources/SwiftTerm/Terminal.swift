@@ -299,7 +299,9 @@ open class Terminal {
     // You can ignore most of the defaults set here, the function
     // reset() will do that again
     var sendFocus: Bool = false
-    var cursorHidden : Bool = false
+    /// Whether DECTCEM has hidden the cursor. Readable from outside so a host serialising the
+    /// screen (for a remote mirror, a snapshot) can reproduce the cursor state it found.
+    public internal(set) var cursorHidden : Bool = false
     
     /// Controls the origin mode (DECOM), when set, the screen is limited to the top and bottom margins
     var originMode: Bool = false
@@ -332,7 +334,13 @@ open class Terminal {
     /// Indicates that the application has toggled bracketed paste mode, which means that when content is pasted into
     /// the terminal, the content will be wrapped in "ESC [ 200 ~" to start, and "ESC [ 201 ~" to end.
     public private(set) var bracketedPasteMode: Bool = false
-    
+
+    /// DECSET 2031: the application asked to be told when the terminal's colour scheme changes,
+    /// with a `CSI ? 997 ; 1|2 n` report. Claude Code enables this at startup; a program that
+    /// hears the report re-asks `OSC 11 ; ?` and re-themes live, which is what makes a theme
+    /// switched under a running agent actually reach it — see `reportColorSchemeChange`.
+    public private(set) var colorSchemeReportingEnabled: Bool = false
+
     private var charset: [UInt8:String]? = nil
     var gcharset: Int = 0
     var reverseWraparound: Bool = false
@@ -379,6 +387,34 @@ open class Terminal {
     /// (see the `isProcessTrusted` method in the `TerminalDelegate`).  When this is set the
     /// `hostCurrentDocumentUpdated` method on the delegate is invoked.
     public private(set) var hostCurrentDocument: String? = nil
+
+    // MARK: - Command Tracking (OSC 133 / FinalTerm)
+
+    /// Position in the buffer where the prompt started (OSC 133;A).
+    /// This is the scroll-invariant row number (absolute position in buffer history).
+    public private(set) var commandPromptStart: Position?
+
+    /// Position in the buffer where the command input started (OSC 133;B - after prompt).
+    public private(set) var commandInputStart: Position?
+
+    /// Position in the buffer where command output started (OSC 133;C - command executing).
+    /// This is for the CURRENT command being executed.
+    private var currentCommandOutputStart: Position?
+
+    /// Position in the buffer where command output ended (OSC 133;D - command finished).
+    /// This is for the CURRENT command being executed.
+    private var currentCommandOutputEnd: Position?
+
+    /// Position where the last COMPLETED command's output started.
+    /// This persists until a new command starts executing.
+    public private(set) var commandOutputStart: Position?
+
+    /// Position where the last COMPLETED command's output ended.
+    /// This persists until a new command starts executing.
+    public private(set) var commandOutputEnd: Position?
+
+    /// Exit code of the last command (from OSC 133;D;exitcode).
+    public private(set) var lastCommandExitCode: Int32?
     
     /// The current attribute used by the terminal by default
     public var currentAttribute: Attribute {
@@ -396,7 +432,7 @@ open class Terminal {
     // The mouse coordinates can be encoded in a number of ways, and obey to historical
     // upgrades to the protocol, but also attempts at fixing limitations of the different
     // encodings.
-    enum MouseProtocolEncoding {
+    public enum MouseProtocolEncoding {
         // The default x10 mode is limited to coordinates up to 223.
         // (255-32).   The other modes solve this limitaion
         case x10
@@ -416,8 +452,12 @@ open class Terminal {
         case sgrPixel
     }
     
-    // The protocol encoding for the terminal
-    private var mouseProtocol: MouseProtocolEncoding = .x10
+    /// The protocol encoding for the terminal.
+    ///
+    /// Readable from the outside because a mirrored terminal has to be able to state this
+    /// contract to a second renderer: a client left guessing x10 while the program asked for
+    /// SGR mislocates every click past column 95 and cannot report a release at all.
+    public private(set) var mouseProtocol: MouseProtocolEncoding = .x10
 
     // This is used to track if we are setting the colors, to prevent a
     // recursive invocation (nativeForegroundColor sets the terminal
@@ -658,6 +698,12 @@ open class Terminal {
         if buffer === normalBuffer {
             return
         }
+
+        // A full-screen program can sit over thousands of normal-buffer scrollback lines. While
+        // that alternate screen is active, window resizes update only what is visible and leave
+        // this buffer at its prior grid; otherwise every drag tick reflows hidden history. Pay
+        // that cost once, at the final grid, only when the normal buffer becomes visible again.
+        resizeNormalBufferToCurrentGridIfNeeded()
         normalBuffer.x = altBuffer.x
         normalBuffer.y = altBuffer.y
         
@@ -684,6 +730,16 @@ open class Terminal {
         altBuffer.fillViewportRows(attribute: fillAttr)
         buffer = altBuffer
     }
+
+    private func resizeNormalBufferToCurrentGridIfNeeded() {
+        guard normalBuffer.cols != cols || normalBuffer.rows != rows else { return }
+
+        let oldCols = normalBuffer.cols
+        let dy = normalBuffer.savedY - normalBuffer.y
+        normalBuffer.resize(newCols: cols, newRows: rows)
+        normalBuffer.savedY = normalBuffer.y + dy
+        normalBuffer.setupTabStops(index: oldCols, tabStopWidth: tabStopWidth)
+    }
     
     func setupTabStops (index: Int = -1)
     {
@@ -692,13 +748,14 @@ open class Terminal {
     }
     
     func resizeBuffers(newColumns: Int, newRows: Int) {
-        // correct the savedY cursor to follow changes to y
-        let dy = normalBuffer.savedY - normalBuffer.y
-        normalBuffer.resize (newCols: newColumns, newRows: newRows)
-        normalBuffer.savedY = normalBuffer.y + dy
-        
+        if buffer !== altBuffer {
+            // Correct the savedY cursor to follow changes to y. When the alternate buffer is
+            // active, defer this potentially large normal-buffer reflow until it is visible.
+            let dy = normalBuffer.savedY - normalBuffer.y
+            normalBuffer.resize(newCols: newColumns, newRows: newRows)
+            normalBuffer.savedY = normalBuffer.y + dy
+        }
         altBuffer.resize (newCols: newColumns, newRows: newRows)
-
     }
     public func setup (isReset: Bool = false)
     {
@@ -725,7 +782,8 @@ open class Terminal {
         setInsertMode(false)
         setWraparound(true)
         bracketedPasteMode = false
-        
+        colorSchemeReportingEnabled = false
+
         // charset'
         charset = nil
         gcharset = 0
@@ -806,7 +864,13 @@ open class Terminal {
             default:
                 ok = 0 // this means the request is not valid, report that to the host.
                 // invalid: DCS 0 $ r Pt ST (xterm)
-                terminal.log ("Unknown DCS + \(newData!)")
+                if !terminal.silentLog {
+                    SwiftTermDiagnostics.emit(
+                        .debug,
+                        .parserUnhandledDeviceControl,
+                        facts: ["byteCount": data.count]
+                    )
+                }
                 // Do not report 'newData', because it can be exploited
                 // see https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=510030
                 result = ""
@@ -820,17 +884,32 @@ open class Terminal {
     func configureParser (_ parser: EscapeSequenceParser)
     {
         parser.csiHandlerFallback = { [unowned self] (pars: [Int], collect: cstring, code: UInt8) -> () in
-            let ch = Character(UnicodeScalar(code))
-            self.log ("SwiftTerm: Unknown CSI Code (collect=\(collect) code=\(ch) pars=\(pars))")
+            guard !self.silentLog else { return }
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .parserUnhandledControlSequence,
+                facts: ["code": Int(code), "parameterCount": pars.count, "collectCount": collect.count]
+            )
         }
         parser.escHandlerFallback = { [unowned self] (txt: cstring, flag: UInt8) in
-            self.log ("SwiftTerm: Unknown ESC Code: ESC + \(Character(Unicode.Scalar (flag))) txt=\(txt)")
+            guard !self.silentLog else { return }
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .parserUnhandledEscape,
+                facts: ["code": Int(flag), "collectCount": txt.count]
+            )
         }
         parser.executeHandlerFallback = { [unowned self] in
-            self.log ("SwiftTerm: Unknown EXECUTE code")
+            guard !self.silentLog else { return }
+            SwiftTermDiagnostics.emit(.debug, .parserUnhandledExecute)
         }
         parser.oscHandlerFallback = { [unowned self] code, data in
-            self.log ("SwiftTerm: Unknown OSC code: \(code)")
+            guard !self.silentLog else { return }
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .parserUnhandledOperatingSystemCommand,
+                facts: ["code": code, "byteCount": data.count]
+            )
         }
         parser.printHandler = { [unowned self] slice in handlePrint (slice) }
         parser.printStateReset = { [unowned self] in printStateReset() }
@@ -959,6 +1038,9 @@ open class Terminal {
         parser.oscHandlers [777] = { [unowned self] data in oscNotification (data) }
         parser.oscHandlers [1337] = { [unowned self] data in osciTerm2 (data) }
 
+        // OSC 133 - FinalTerm/Semantic Prompt sequences for command tracking
+        parser.oscHandlers [133] = { [unowned self] data in oscFinalTerm (data) }
+
         //
         // ESC handlers
         //
@@ -1002,7 +1084,9 @@ open class Terminal {
 
         // Error handler
         parser.errorHandler = { [unowned self] state in
-            self.log ("SwiftTerm: Parsing error, state: \(state)")
+            if !self.silentLog {
+                SwiftTermDiagnostics.emit(.warning, .parserStateError)
+            }
             return state
         }
 
@@ -1199,8 +1283,16 @@ open class Terminal {
             }
 
             if let firstScalar = ch.unicodeScalars.first {
+                // Variation selectors are zero-width modifiers of the character before them
+                // (VS16 selects emoji presentation), but their combining class is 0, so the
+                // combining branch alone never catches them. Falling through would spend a
+                // whole phantom cell on an invisible character and advance the cursor past
+                // where the application believes it is — its next absolute cursor position
+                // then lands one column short, on top of the glyph it just echoed.
+                let isVariationSelector = (0xFE00...0xFE0F).contains (firstScalar.value)
+
                 // If this is a Unicode combining character
-                if firstScalar.properties.canonicalCombiningClass != .notReordered {
+                if firstScalar.properties.canonicalCombiningClass != .notReordered || isVariationSelector {
                     // Determine if the last time we poked at a character is still valid
                     let last = buffer.lastBufferStorage
                     if last.cols == cols && last.rows == rows {
@@ -1208,10 +1300,10 @@ open class Terminal {
                         let existingLine = buffer.lines [last.y]
                         let lastx = last.x >= cols ? cols-1 : last.x
                         var cd = existingLine [lastx]
-                        
+
                         // Attemp the combination
                         let newStr = String ([cd.getCharacter (), ch])
-                        
+
                         // If the resulting string is 1 grapheme cluster, then it combined properly
                         if newStr.count == 1 {
                             if let newCh = newStr.first {
@@ -1221,6 +1313,11 @@ open class Terminal {
                                 continue
                             }
                         }
+                    }
+                    // A variation selector that could not combine is dropped rather than
+                    // given a cell of its own.
+                    if isVariationSelector {
+                        continue
                     }
                 }
             }
@@ -1558,16 +1655,110 @@ open class Terminal {
         guard let text = String(bytes: data, encoding: .utf8) else {
             return
         }
-        
+
         let parts = text.components(separatedBy: ";")
         guard parts.count >= 3,
               parts[0] == "notify" else {
             return
         }
-        
+
         let title = parts[1]
         let body = parts[2...].joined(separator: ";")
         tdel?.notify(source: self, title: title, body: body)
+    }
+
+    // OSC 133 - FinalTerm/Semantic Prompt sequences
+    // Used for shell integration to track command boundaries
+    // Format: ESC ] 133 ; <cmd> [; <param>] BEL
+    //
+    // Commands:
+    //   A - Prompt start (fresh line, prompt will be drawn)
+    //   B - Command start (user input begins after prompt)
+    //   C - Command executed (output will follow)
+    //   D [; exitcode] - Command finished
+    //
+    // Debug helper to write to log file
+    private func osc133Log(_ message: String) {
+        #if DEBUG
+        let logPath = "/tmp/threading-osc133.log"
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        if let data = line.data(using: .utf8) {
+            if FileManager.default.fileExists(atPath: logPath) {
+                if let handle = FileHandle(forWritingAtPath: logPath) {
+                    handle.seekToEndOfFile()
+                    handle.write(data)
+                    handle.closeFile()
+                }
+            } else {
+                try? data.write(to: URL(fileURLWithPath: logPath))
+            }
+        }
+        #endif
+    }
+
+    func oscFinalTerm(_ data: ArraySlice<UInt8>) {
+        guard let text = String(bytes: data, encoding: .utf8), !text.isEmpty else {
+            return
+        }
+
+        let parts = text.components(separatedBy: ";")
+        guard let command = parts.first, !command.isEmpty else {
+            return
+        }
+
+        // Get current buffer position (scroll-invariant)
+        let currentPosition = Position(col: buffer.x, row: buffer.yBase + buffer.y)
+
+        switch command {
+        case "A":
+            // Prompt start - new command cycle begins
+            // Don't clear completed command output - it should persist until C is received
+            commandPromptStart = currentPosition
+            commandInputStart = nil
+            currentCommandOutputStart = nil
+            currentCommandOutputEnd = nil
+            osc133Log("A: prompt at \(currentPosition), preserved output: \(String(describing: commandOutputStart))->\(String(describing: commandOutputEnd))")
+
+        case "B":
+            // Command input start (after prompt text)
+            commandInputStart = currentPosition
+            osc133Log("B: input start at \(currentPosition)")
+
+        case "C":
+            // Command executing - output will follow
+            // Only set if not already set (avoid resetting from subcommand DEBUG traps)
+            if currentCommandOutputStart == nil {
+                currentCommandOutputStart = currentPosition
+                osc133Log("C: output START at \(currentPosition) (first C)")
+            } else {
+                osc133Log("C: IGNORED at \(currentPosition) (already have start at \(currentCommandOutputStart!))")
+            }
+            currentCommandOutputEnd = nil
+
+        case "D":
+            // Command finished - finalize the current command's output range
+            currentCommandOutputEnd = currentPosition
+
+            // Copy current command output to the "last completed" positions
+            // These will persist even after A is received
+            if let start = currentCommandOutputStart {
+                commandOutputStart = start
+                commandOutputEnd = currentCommandOutputEnd
+                osc133Log("D: output END at \(currentPosition), finalized: \(start)->\(currentPosition)")
+            } else {
+                osc133Log("D: output END at \(currentPosition), but no start position!")
+            }
+
+            // Parse exit code if provided (format: "D;0" or "D;1")
+            if parts.count > 1, let exitCode = Int32(parts[1]) {
+                lastCommandExitCode = exitCode
+                osc133Log("D: exit code = \(exitCode)")
+            }
+
+        default:
+            break
+        }
     }
 
     // OSC 1337 is used by iTerm2 for imgcat and other things:
@@ -1700,53 +1891,66 @@ open class Terminal {
     func reportColor (oscCode: Int, color: Color) {
         sendResponse(cc.OSC, "\(oscCode);\(color.formatAsXcolor ())", cc.ST)
     }
+
+    /// Tells the application the terminal's colour scheme changed, if it subscribed (DECSET 2031).
+    ///
+    /// The report carries one bit — `CSI ? 997 ; 1 n` for dark, `; 2 n` for light — and is a
+    /// *prompt*, not the news itself: a program that hears it re-asks `OSC 11 ; ?` and reads the
+    /// answer. The embedder must therefore update `backgroundColor` **before** calling this, or
+    /// the re-ask is answered with the palette the terminal just left.
+    public func reportColorSchemeChange (dark: Bool) {
+        guard colorSchemeReportingEnabled else { return }
+        sendResponse (cc.CSI, "?997;\(dark ? 1 : 2)n")
+    }
     
     // This handles both setting the foreground, but spill into background and cursor color
     // if more parameters are provided (ie, sending OSC 10 with #ffffff,#000000,#ff0000
     // sets the foreground to #ffffff, background to #000000 and cursor to ff0000
     //
-    // - Parameter startAt: describes which of the colors is the first to try,
-    // startAt = 0 is foreground, startAt = 1 is background, startAt = 2 is
-    // the cursor Color
+    // A parameter of "?" asks rather than sets, and is answered on the wire with the OSC code
+    // for the color it named: 10 foreground, 11 background, 12 cursor.
+    //
+    // - Parameter startAt: which color the *first* parameter names — 0 foreground (OSC 10),
+    // 1 background (OSC 11), 2 cursor (OSC 12). Each further parameter names the next color
+    // along, which is why this is an offset rather than an index into the parameters: read as
+    // an index, OSC 11's single parameter sits at 0 and the loop starting at 1 never ran. Every
+    // `OSC 11 ; ? ST` therefore went unanswered — and a program that asks what colour the
+    // terminal is and hears nothing assumes a dark one, which is how a light palette ended up
+    // wearing an agent's dark-theme ink.
     func oscSetColors (_ data: ArraySlice<UInt8>, startAt: Int)
     {
         let groups = data.split(separator: UInt8 (ascii: ";"))
-        var next = startAt
-        while next < groups.count {
-            defer { next += 1 }
-            let text = groups [next]
-            
+
+        for (offset, text) in groups.enumerated() {
+            let slot = startAt + offset
+            guard slot <= 2 else { break }
+
             if text.first == UInt8 (ascii: "?") {
-                switch next {
+                switch slot {
                 case 0:
                     reportColor (oscCode: 10, color: foregroundColor)
                 case 1:
                     reportColor (oscCode: 11, color: backgroundColor)
-                case 2:
-                    reportColor (oscCode: 11, color: cursorColor ?? foregroundColor)
                 default:
-                    break
+                    reportColor (oscCode: 12, color: cursorColor ?? foregroundColor)
                 }
-                
+
                 continue
             }
 
             guard let color = Color.parseColor(text) else {
                 continue
             }
-            switch next {
+            switch slot {
             case 0:
                 foregroundColor = color
                 tdel?.setForegroundColor(source: self, color: color)
             case 1:
                 backgroundColor = color
                 tdel?.setBackgroundColor(source: self, color: color)
-            case 2:
+            default:
                 cursorColor = color
                 tdel?.setCursorColor(source: self, color: color)
-                break
-            default:
-                break
             }
         }
     }
@@ -2520,7 +2724,7 @@ open class Terminal {
             //   Pu = 0  or omitted ⇒  default to character cells.
             //   Pu = 1  ⇐  device physical pixels.
             //   Pu = 2  ⇐  character cells.
-            print ("TODO: Enable Locator Reporting (DECELR)")
+            log("Locator reporting (DECELR) is not implemented")
         default:
             break
         }
@@ -2993,6 +3197,8 @@ open class Terminal {
                 // keyboard emulation mode: 1050, 1051, 1052, 1053, 1060, 1061
             case 2004:
                 res = bracketedPasteMode ? modeSet : modeReset
+            case 2031:
+                res = colorSchemeReportingEnabled ? modeSet : modeReset
             default:
                 break
             }
@@ -3390,7 +3596,7 @@ open class Terminal {
         }
         
         while i < parCount {
-            var p = pars [i]
+            let p = pars [i]
             switch p {
             case 0:
                 // default
@@ -3472,13 +3678,11 @@ open class Terminal {
                 // reset bg
                 bg = CharData.defaultAttr.bg
             case 90...97:
-                // fg color 16
-                p += 8
-                fg = Attribute.Color.ansi256(code: UInt8(p - 90))
+                // fg bright color (8-15)
+                fg = Attribute.Color.ansi256(code: UInt8(p - 90 + 8))
             case 100...107:
-                // bg color 16
-                p += 8;
-                bg = Attribute.Color.ansi256(code: UInt8(p - 100))
+                // bg bright color (8-15)
+                bg = Attribute.Color.ansi256(code: UInt8(p - 100 + 8))
                 
             case 58:
                 // WezTerm extension:
@@ -3496,7 +3700,11 @@ open class Terminal {
                 }
                 
             default:
-                print ("Unknown SGR attribute: \(p) \(pars)")
+                SwiftTermDiagnostics.emit(
+                    .debug,
+                    .terminalUnsupportedSGR,
+                    facts: ["attribute": p, "parameterCount": pars.count]
+                )
             }
             i += 1
         }
@@ -3705,6 +3913,9 @@ open class Terminal {
             case 2004: // bracketed paste mode (https://cirw.in/blog/bracketed-paste)
                 bracketedPasteMode = false
                 break
+
+            case 2031: // colour-scheme change reports (CSI ? 997 ; 1|2 n)
+                colorSchemeReportingEnabled = false
             default:
                 log ("Unhandled DEC Private Mode Reset (DECRST) with \(par)")
                 break
@@ -3939,6 +4150,9 @@ open class Terminal {
             case 2004: // bracketed paste mode (https://cirw.in/blog/bracketed-paste)
                 // TODO: must implement bracketed paste mode
                 bracketedPasteMode = true
+
+            case 2031: // colour-scheme change reports (CSI ? 997 ; 1|2 n)
+                colorSchemeReportingEnabled = true
             default:
                 log ("Unhandled DEC Private Mode Set (DECSET) with \(par)")
                 break;
@@ -4425,29 +4639,25 @@ open class Terminal {
             } else if let c = item as? UInt8 {
                 buffer.append (c)
             } else {
-                log ("Do not know how to handle type \(item)")
+                SwiftTermDiagnostics.emit(.fault, .terminalSendResponseTypeInvariant)
             }
         }
         tdel?.send (source: self, data: buffer[...])
     }
     
-#if DEBUG
     public var silentLog = false
-#else
-    public var silentLog = true
-#endif
     
     func error (_ text: String)
     {
         if !silentLog {
-            print("Error: \(text)")
+            SwiftTermDiagnostics.emit(.warning, .parserStateError)
         }
     }
     
     func log (_ text: String)
     {
         if !silentLog {
-            print("Info: \(text)")
+            SwiftTermDiagnostics.emit(.debug, .terminalUnsupportedSequence)
         }
     }
     
@@ -4771,7 +4981,17 @@ open class Terminal {
             let scrollRegionHeight = bottomRow - topRow + 1 /*as it's zero-based*/
             if scrollRegionHeight > 1 {
                 if !buffer.lines.shiftElements (start: topRow + 1, count: scrollRegionHeight - 1, offset: -1) {
-                    print ("Assertion on scroll, state was: bottomRow=\(bottomRow) topRow=\(topRow) yDisp=\(buffer.yDisp) linesTop=\(buffer.linesTop) isAlternate=\(isCurrentBufferAlternate)")
+                    SwiftTermDiagnostics.emit(
+                        .fault,
+                        .terminalScrollInvariant,
+                        facts: [
+                            "bottomRow": bottomRow,
+                            "topRow": topRow,
+                            "displayRow": buffer.yDisp,
+                            "linesTop": buffer.linesTop,
+                            "alternate": isCurrentBufferAlternate ? 1 : 0
+                        ]
+                    )
                 }
             }
             buffer.lines [bottomRow] = BufferLine (from: newLine)
@@ -4897,7 +5117,9 @@ open class Terminal {
         self.rows = newRows
         options.cols = newCols
         options.rows = newRows
-        normalBuffer.setupTabStops (index: oldCols, tabStopWidth: tabStopWidth)
+        if normalBuffer.cols == newCols {
+            normalBuffer.setupTabStops(index: oldCols, tabStopWidth: tabStopWidth)
+        }
         altBuffer.setupTabStops (index: oldCols, tabStopWidth: tabStopWidth)
         refresh (startRow: 0, endRow: self.rows - 1)
     }
@@ -5117,7 +5339,17 @@ open class Terminal {
             // blankLine(true) is xterm/linux behavior
             let scrollRegionHeight = buffer.scrollBottom - buffer.scrollTop
             if !buffer.lines.shiftElements (start: buffer.y + buffer.yBase, count: scrollRegionHeight, offset: 1) {
-                print ("Assertion on reverseIndex, state was: y=\(buffer.y) scrollTop=\(buffer.scrollTop)  yDisp=\(buffer.yDisp) linesTop=\(buffer.linesTop) isAlternate=\(isCurrentBufferAlternate)")
+                SwiftTermDiagnostics.emit(
+                    .fault,
+                    .terminalReverseIndexInvariant,
+                    facts: [
+                        "row": buffer.y,
+                        "scrollTop": buffer.scrollTop,
+                        "displayRow": buffer.yDisp,
+                        "linesTop": buffer.linesTop,
+                        "alternate": isCurrentBufferAlternate ? 1 : 0
+                    ]
+                )
             }
             buffer.lines [buffer.y + buffer.yBase] = buffer.getBlankLine (attribute: eraseAttr ())
             updateRange (startLine: buffer.scrollTop, endLine: buffer.scrollBottom)
@@ -5197,6 +5429,76 @@ open class Terminal {
         }
         return result
     }
+
+    /// Returns the recent complete logical lines in the terminal buffer, bounded by their UTF-8
+    /// representation.
+    ///
+    /// `getBufferAsData` is a presentation export: it puts a newline after every grid row. That
+    /// is the right shape for a screen snapshot and the wrong one for consumers looking for
+    /// semantic text, because a terminal's automatic wrap is not a line break. This variant
+    /// joins rows whose `isWrapped` bit says they continue the preceding row, while preserving
+    /// real line breaks between logical lines.
+    ///
+    /// The bound is applied while walking backwards, before the complete buffer is materialized.
+    /// Only complete logical lines are returned. If the oldest line that would be included is
+    /// larger than the remaining budget, it and everything older are omitted rather than
+    /// returning a fragment that could be mistaken for complete text. The same rule drops a
+    /// continuation whose beginning has already fallen out of scrollback.
+    ///
+    /// - Parameters:
+    ///   - maximumUTF8Bytes: The largest UTF-8 representation the result may have.
+    ///   - kind: Which terminal buffer to inspect.
+    public func getRecentLogicalBufferText (
+        maximumUTF8Bytes: Int,
+        kind: BufferKind = .active
+    ) -> String
+    {
+        guard maximumUTF8Bytes > 0 else { return "" }
+
+        let b = bufferFromKind(kind: kind)
+        guard b.lines.count > 0 else { return "" }
+
+        // Each entry is one logical line, with its physical rows stored newest-first because the
+        // buffer itself is being walked backwards. Logical lines use the same order until the
+        // final assembly below.
+        var logicalLinesNewestFirst: [[String]] = []
+        var currentRowsNewestFirst: [String] = []
+        var currentBytes = 0
+        var acceptedBytes = 0
+
+        for row in stride(from: b.lines.count - 1, through: 0, by: -1) {
+            let bufferLine = b.lines[row]
+            let text = bufferLine.translateToString(trimRight: true)
+            let bytes = text.utf8.count
+            let separatorBytes = logicalLinesNewestFirst.isEmpty ? 0 : 1
+            let remaining = maximumUTF8Bytes - acceptedBytes - separatorBytes
+
+            // Stop at the first incomplete logical line. Skipping across it would no longer be a
+            // recent suffix, and returning its tail would manufacture path- or URL-shaped text.
+            guard remaining >= 0,
+                  currentBytes <= remaining,
+                  bytes <= remaining - currentBytes else {
+                break
+            }
+
+            currentRowsNewestFirst.append(text)
+            currentBytes += bytes
+
+            // `isWrapped` belongs to this row: true means it continues the row before it. Until
+            // a non-wrapped row is reached, the logical line has no known beginning and cannot
+            // be returned safely.
+            guard !bufferLine.isWrapped else { continue }
+
+            logicalLinesNewestFirst.append(currentRowsNewestFirst)
+            acceptedBytes += separatorBytes + currentBytes
+            currentRowsNewestFirst.removeAll(keepingCapacity: true)
+            currentBytes = 0
+        }
+
+        return logicalLinesNewestFirst.reversed().map { rowsNewestFirst in
+            rowsNewestFirst.reversed().joined()
+        }.joined(separator: "\n")
+    }
     
     /// Returns the text between the specified range
     ///
@@ -5211,6 +5513,21 @@ open class Terminal {
             r += line.toString()
         }
         return r
+    }
+
+    /// Returns the output of the last command if OSC 133 shell integration is active.
+    /// Returns nil if no command output has been captured.
+    public func getLastCommandOutput() -> String? {
+        guard let start = commandOutputStart,
+              let end = commandOutputEnd else {
+            return nil
+        }
+        return getText(start: start, end: end)
+    }
+
+    /// Returns true if shell integration (OSC 133) has captured command output.
+    public var hasCommandOutput: Bool {
+        commandOutputStart != nil && commandOutputEnd != nil
     }
 
     // This version validates the input parameters

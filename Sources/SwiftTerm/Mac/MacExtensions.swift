@@ -11,29 +11,29 @@ import AppKit
 
 extension NSColor {
     func getTerminalColor () -> Color {
-        guard let color = self.usingColorSpace(.deviceRGB) else {
+        guard let color = self.usingColorSpace(.sRGB) else {
             return Color.defaultForeground
         }
-        
+
         var red: CGFloat = 0.0, green: CGFloat = 0.0, blue: CGFloat = 0.0, alpha: CGFloat = 1.0
         color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
         return Color(red: UInt16(red*65535), green: UInt16(green*65535), blue: UInt16(blue*65535))
     }
     func inverseColor() -> NSColor {
-        guard let color = self.usingColorSpace(.deviceRGB) else {
+        guard let color = self.usingColorSpace(.sRGB) else {
             return self
         }
-        
+
         var red: CGFloat = 0.0, green: CGFloat = 0.0, blue: CGFloat = 0.0, alpha: CGFloat = 1.0
         color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
-        return NSColor(calibratedRed: 1.0 - red, green: 1.0 - green, blue: 1.0 - blue, alpha: alpha)
+        return NSColor(srgbRed: 1.0 - red, green: 1.0 - green, blue: 1.0 - blue, alpha: alpha)
     }
 
     static func make (red: CGFloat, green: CGFloat, blue: CGFloat, alpha: CGFloat) -> NSColor
     {
-        return NSColor (deviceRed: red, green: green, blue: blue, alpha: alpha)
+        return NSColor (srgbRed: red, green: green, blue: blue, alpha: alpha)
     }
-    
+
     static func make (hue: CGFloat, saturation: CGFloat, brightness: CGFloat, alpha: CGFloat) -> TTColor
     {
         return NSColor (
@@ -45,7 +45,7 @@ extension NSColor {
 
     static func make (color: Color) -> NSColor
     {
-        return NSColor (deviceRed: CGFloat (color.red) / 65535.0,
+        return NSColor (srgbRed: CGFloat (color.red) / 65535.0,
                         green: CGFloat (color.green) / 65535.0,
                         blue: CGFloat (color.blue) / 65535.0,
                         alpha: 1.0)
@@ -70,13 +70,14 @@ extension NSView {
        self.getRectsBeingDrawn(&rectsPtr, count: &count)
 
        return Array(UnsafeBufferPointer(start: rectsPtr, count: count))
-     }
+    }
     
     public func pending(_ msg: String = "PENDING RECTS") {
-        print (msg)
-        for x in rectsBeingDrawn() {
-            print ("   -> \(x)")
-        }
+        SwiftTermDiagnostics.emit(
+            .debug,
+            .uiDrawingInspectionSuppressed,
+            facts: ["rectangleCount": rectsBeingDrawn().count]
+        )
     }
 }
 extension NSAttributedString {

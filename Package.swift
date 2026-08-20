@@ -5,6 +5,9 @@ import PackageDescription
 #if os(Linux) || os(Windows)
 let platformExcludes = ["Apple", "Mac", "iOS"]
 #else
+// Package manifests run for the host OS, not the target being compiled. A macOS host can build
+// both the Threading Mac app and its iOS app in one graph, so excluding `iOS` here would remove
+// `TerminalView` from an iPhone build. The Darwin sources already use `#if os(...)` guards.
 let platformExcludes: [String] = []
 #endif
 
@@ -48,9 +51,7 @@ let products: [Product] = [
 let targets: [Target] = [
     .target(
         name: "SwiftTerm",
-        dependencies: [
-            .product(name: "Subprocess", package: "swift-subprocess", condition: .when(platforms: [.macOS, .linux]))
-        ],
+        dependencies: [],
         path: "Sources/SwiftTerm",
         exclude: platformExcludes
     ),
@@ -85,8 +86,7 @@ let package = Package(
     ],
     products: products,
     dependencies: [
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0"),
-        .package(url: "https://github.com/swiftlang/swift-subprocess", branch: "main")
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.0.0")
     ],
     targets: targets,
     swiftLanguageVersions: [.v5]

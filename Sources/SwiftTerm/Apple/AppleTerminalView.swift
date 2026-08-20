@@ -36,6 +36,38 @@ struct ViewLineInfo {
     var images: [TerminalImage]?
 }
 
+/// Chooses the glyph presentation without changing the character held by the terminal buffer.
+///
+/// CoreText is free to satisfy a missing glyph from Apple Color Emoji. That is correct for a
+/// two-cell emoji, but wrong for an emoji-capable symbol whose terminal width is one cell: the
+/// fallback bitmap is wider than the grid slot and collides with the following character. VS15
+/// requests the Unicode text presentation from the fallback cascade instead. Restricting the
+/// rewrite to simple one- or two-scalar graphemes leaves joined emoji, modifiers and keycaps
+/// untouched, and the stored character remains available verbatim for copy and extraction.
+enum TerminalGlyphPresentation {
+    private static let textVariationSelector = UnicodeScalar(0xFE0E)!
+    private static let emojiVariationSelector = UnicodeScalar(0xFE0F)!
+
+    static func character(for character: Character, cellWidth: Int8) -> Character {
+        guard cellWidth == 1,
+              let base = character.unicodeScalars.first,
+              base.value > 0x7F,
+              base.properties.isEmoji
+        else { return character }
+
+        let scalars = character.unicodeScalars
+        guard scalars.count <= 2 else { return character }
+        if scalars.count == 2 {
+            guard let selector = scalars.last,
+                  selector == textVariationSelector || selector == emojiVariationSelector
+            else { return character }
+            if selector == textVariationSelector { return character }
+        }
+
+        return Character(String(base) + String(textVariationSelector))
+    }
+}
+
 extension TerminalView {
     typealias CellDimension = CGSize
     
@@ -45,6 +77,10 @@ extension TerminalView {
         self.urlAttributes = [:]
         self.colors = Array(repeating: nil, count: 256)
         self.trueColors = [:]
+        #if os(macOS)
+        self.evaluatedTextContrast = []
+        self.reportedTextContrast = []
+        #endif
     }
     
     // This is invoked when the font changes to recompute state
@@ -52,9 +88,22 @@ extension TerminalView {
     {
         resetCaches()
         self.cellDimension = computeFontDimensions ()
+        #if os(iOS) || os(visionOS)
+        // Font changes are pixel-size changes too. Route them through the same managed-grid seam
+        // as layout so an iPhone rendering a Mac-owned grid can zoom without reflowing or
+        // soft-resetting the emulator to the phone's dimensions.
+        if !processSizeChange(newSize: frame.size) {
+            accessibility.invalidate()
+            search.invalidate()
+            updateScroller()
+        }
+        terminal.updateFullScreen()
+        setNeedsDisplay(bounds)
+        #else
         let newCols = Int(frame.width / cellDimension.width)
         let newRows = Int(frame.height / cellDimension.height)
         resize(cols: newCols, rows: newRows)
+        #endif
         updateCaretView()
     }
     
@@ -121,8 +170,16 @@ extension TerminalView {
     func processSizeChange (newSize: CGSize) -> Bool {
         let newRows = Int (newSize.height / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
-        
+
         if newCols != terminal.cols || newRows != terminal.rows {
+            // A subclass holding the emulator on a managed grid — a phone's viewport driving a
+            // Mac's PTY — gets asked before anything is touched. `terminal.resize` reflows the
+            // buffer and the resize path soft-resets it, so a view that is merely laid out at a
+            // different pixel size than its grid would otherwise lose the scrolling region of
+            // whatever full-screen program is running, on every single layout pass.
+            guard shouldApplyFrameSizeChange (newCols: newCols, newRows: newRows) else {
+                return false
+            }
             selection.active = false
             terminal.resize (cols: newCols, rows: newRows)
             
@@ -130,7 +187,9 @@ extension TerminalView {
             accessibility.invalidate ()
             search.invalidate ()
             
-            terminalDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
+            if shouldReportSizeChange(newCols: newCols, newRows: newRows) {
+                terminalDelegate?.sizeChanged(source: self, newCols: newCols, newRows: newRows)
+            }
            
             updateScroller()
             return true
@@ -171,7 +230,14 @@ extension TerminalView {
         switch color {
         case .defaultColor:
             if isFg {
-                return nativeForegroundColor
+                // **Threading's seam.** A palette may state a separate colour for bold text
+                // drawn with the *default* foreground — Terminal.app's "Bold Text" — because a
+                // heading written as SGR 1 in the default colour is otherwise only a weight,
+                // and on a palette whose foreground is already its brightest tone that is no
+                // difference at all. Nil means "the same as the foreground", which is what
+                // this returned before the property existed. Text that names an ANSI colour
+                // never arrives here: it keeps the bold-to-bright shift below.
+                return (isBold ? nativeBoldForegroundColor : nil) ?? nativeForegroundColor
             } else {
                 return nativeBackgroundColor
             }
@@ -186,7 +252,8 @@ extension TerminalView {
             // if high - bright colors are enabled we will represent bold text by using more intense colors
             // otherwise we will reduce colors but use bold fonts
             if useBrightColors {
-                midx = ansi < 7 ? (Int (ansi) + (isBold ? 8 : 0)) : Int (ansi)
+                // Colors 0-7 become 8-15 when bold (bright versions)
+                midx = ansi < 8 ? (Int (ansi) + (isBold ? 8 : 0)) : Int (ansi)
             } else {
                 midx = ansi > 7 ? (Int (ansi) - 8) : Int(ansi)
             }
@@ -198,6 +265,21 @@ extension TerminalView {
             colors [midx] = newColor
             return newColor
         case .trueColor(let r, let g, let b):
+            #if os(macOS)
+            // A background may be rewritten by the host; a foreground is never touched. The two
+            // roles take separate caches because the key here is the colour alone.
+            if !isFg, let transform = trueColorBackgroundTransform {
+                if let cached = trueColorBackgrounds [color] {
+                    return cached
+                }
+                let harmonized = transform (TTColor.make(red: CGFloat (r) / 255.0,
+                                                         green: CGFloat (g) / 255.0,
+                                                         blue: CGFloat (b) / 255.0,
+                                                         alpha: 1.0))
+                trueColorBackgrounds [color] = harmonized
+                return harmonized
+            }
+            #endif
             if let tc = trueColors [color] {
                 return tc
             }
@@ -205,10 +287,27 @@ extension TerminalView {
                                         green: CGFloat (g) / 255.0,
                                         blue: CGFloat (b) / 255.0,
                                         alpha: 1.0)
-            
+
             trueColors [color] = newColor
             return newColor
         }
+    }
+
+    /// **Ours.** The colour this attribute's text is actually drawn in, resolved through the
+    /// same cached path the renderer uses — inverse, bold-as-bright, the bold foreground and
+    /// SGR 2 faintness included.
+    ///
+    /// It exists so the embedder can assert on the rendered answer without reaching into
+    /// internals: `getAttributes` is what draws, so anything else would be a second
+    /// implementation of the rule under test.
+    func resolvedForeground (for attribute: Attribute) -> TTColor
+    {
+        guard let attributes = getAttributes (attribute, withUrl: false),
+              let colour = attributes [.foregroundColor] as? TTColor
+        else {
+            return nativeForegroundColor
+        }
+        return colour
     }
 
     // Clears the cached state for colors and triggers a full display
@@ -216,7 +315,14 @@ extension TerminalView {
     {
         urlAttributes = [:]
         attributes = [:]
-        
+        #if os(macOS)
+        // The transform measures against the palette's own background, so every cached answer
+        // is stale the moment the palette moves.
+        trueColorBackgrounds = [:]
+        evaluatedTextContrast = []
+        reportedTextContrast = []
+        #endif
+
         terminal.updateFullScreen ()
         queuePendingDisplay()
     }
@@ -303,6 +409,14 @@ extension TerminalView {
             tf = fontSet.normal
         }
         
+        // SGR 2 (faint): half strength, blended over whatever the cell's background is by
+        // drawing the foreground at half alpha. CLIs mark autosuggestions and hints with
+        // faint, and rendering them at full strength made a suggestion indistinguishable
+        // from text the user actually typed.
+        if flags.contains (.dim) {
+            fg = fg.withAlphaComponent (fg.alphaComponent * 0.5)
+        }
+
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fg,
@@ -363,7 +477,15 @@ extension TerminalView {
             tf = fontSet.normal
         }
         
-        let fgColor = mapColor (color: fg, isFg: true, isBold: isBold, useBrightColors: useBrightColors)
+        var fgColor = mapColor (color: fg, isFg: true, isBold: isBold, useBrightColors: useBrightColors)
+        // SGR 2 (faint): drawn at half alpha so it blends toward the cell's own background.
+        // CLIs mark autosuggestions and hints with faint, and rendering them at full
+        // strength made a suggestion indistinguishable from text the user actually typed.
+        // The attribute cache keys include the style flags, so the dimmed variant caches
+        // separately from the normal one.
+        if flags.contains (.dim) {
+            fgColor = fgColor.withAlphaComponent (fgColor.alphaComponent * 0.5)
+        }
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
             .foregroundColor: fgColor,
@@ -403,6 +525,22 @@ extension TerminalView {
         
         var str = prefix
         var col = 0
+        let tracksSelectionOffsets = selection?.active == true
+        var renderedUTF16Length = tracksSelectionOffsets ? prefix.utf16.count : 0
+        var cellUTF16Offsets = tracksSelectionOffsets
+            ? Array(repeating: renderedUTF16Length, count: cols + 1)
+            : []
+
+        func appendRun(_ string: String, attribute: Attribute, hasUrl: Bool) {
+            guard !string.isEmpty else { return }
+            res.append(NSAttributedString(
+                string: string,
+                attributes: getAttributes(attribute, withUrl: hasUrl)
+            ))
+            #if os(macOS)
+            inspectTextContrast(in: string, attribute: attribute)
+            #endif
+        }
         
         while col < cols {
             let ch: CharData = line[col]
@@ -418,7 +556,7 @@ extension TerminalView {
                 }
 
                 if attr != ch.attribute || chhas != hasUrl {
-                    res.append(NSAttributedString (string: str, attributes: getAttributes (attr, withUrl: hasUrl)))
+                    appendRun(str, attribute: attr, hasUrl: hasUrl)
                     str = ""
                     attr = ch.attribute
                     hasUrl = chhas
@@ -426,32 +564,302 @@ extension TerminalView {
             }
             
             let code = ch.code
-            let notWide = code <= 0xa0 || (code > 0x452 && code < 0x1100) || Wcwidth.scalarSize(Int(code)) < 2
+            // The cell's stored width is authoritative, not the code point: the terminal
+            // upgrades a narrow-by-wcwidth character to wide when a variation selector
+            // follows it (an emoji such as 🌶︎ + VS16). Re-deriving width from the code
+            // point alone called those narrow, so the wide char's placeholder cell was
+            // rendered instead of skipped — and its `Attribute.empty` sentinel carries an
+            // inverted background, which painted a white box over the glyph's second half.
+            let notWide = ch.width < 2
             if notWide  {
-                str.append(code == 0 ? " " : ch.getCharacter ())
+                if tracksSelectionOffsets {
+                    cellUTF16Offsets[col] = renderedUTF16Length
+                }
+                let storedCharacter = code == 0 ? Character(" ") : ch.getCharacter()
+                // ASCII is overwhelmingly the common case and cannot enter this policy. Keep
+                // its hot path to the same scalar-free append SwiftTerm used before.
+                let renderedCharacter = code > 0x7F
+                    ? TerminalGlyphPresentation.character(
+                        for: storedCharacter,
+                        cellWidth: ch.width
+                    )
+                    : storedCharacter
+                str.append(renderedCharacter)
+                if tracksSelectionOffsets {
+                    renderedUTF16Length += String(renderedCharacter).utf16.count
+                    cellUTF16Offsets[col + 1] = renderedUTF16Length
+                }
             } else {
                 // If we have a wide character, we flush the contents we have so far
-                res.append(NSAttributedString (string: str, attributes: getAttributes (attr, withUrl: hasUrl)))
+                appendRun(str, attribute: attr, hasUrl: hasUrl)
                 // Then add the character, and add an extra space, so that the space gets the same attributes as the previous
                 // cell - see https://github.com/migueldeicaza/SwiftTerm/pull/387
-                res.append(NSAttributedString (string: "\(ch.getCharacter()) ", attributes: getAttributes (attr, withUrl: hasUrl)))
-                
+                let renderedCharacter = ch.getCharacter()
+                appendRun("\(renderedCharacter) ", attribute: attr, hasUrl: hasUrl)
+
+                if tracksSelectionOffsets {
+                    cellUTF16Offsets[col] = renderedUTF16Length
+                    renderedUTF16Length += String(renderedCharacter).utf16.count
+                    cellUTF16Offsets[col + 1] = renderedUTF16Length
+                    renderedUTF16Length += 1
+                    if col + 2 <= cols {
+                        cellUTF16Offsets[col + 2] = renderedUTF16Length
+                    }
+                }
+
                 str = ""
                 col += 1
             }
             col += 1
         }
-        res.append (NSAttributedString(string: str, attributes: getAttributes(attr, withUrl: hasUrl)))
-        updateSelectionAttributesIfNeeded(attributedLine: res, row: row, cols: cols)
+        appendRun(str, attribute: attr, hasUrl: hasUrl)
+        updateSelectionAttributesIfNeeded(
+            attributedLine: res,
+            row: row,
+            cols: cols,
+            cellUTF16Offsets: cellUTF16Offsets
+        )
         // This gives us a large chunk of our performance back, from 7.5 to 5.5 seconds on
         // time for x in 1 2 3 4 5 6; do cat UTF-8-demo.txt; done
         //res.fixAttributes(in: NSRange(location: 0, length: res.length))
         return ViewLineInfo(attrStr: res, images: line.images)
     }
+
+    #if os(macOS)
+    /// Inspects one already-grouped run from a visible row. The work is constant-bounded per run:
+    /// at most 64 scalars are sampled, and colour-pair caches are capped independently of a
+    /// program's truecolour cardinality.
+    private func inspectTextContrast(in string: String, attribute: Attribute) {
+        guard let onLowContrastText,
+              !attribute.style.contains(.invisible)
+        else { return }
+
+        var foreground = attribute.fg
+        var background = attribute.bg
+        if attribute.style.contains(.inverse) {
+            swap(&foreground, &background)
+            if foreground == .defaultColor { foreground = .defaultInvertedColor }
+            if background == .defaultColor { background = .defaultInvertedColor }
+        }
+
+        let isBold = attribute.style.contains(.bold)
+        let foregroundSource = renderedColorSource(
+            foreground,
+            isForeground: true,
+            isBold: isBold
+        )
+        // A default foreground is the terminal-safe answer programs use when they want the
+        // palette to choose readable text. Only an explicitly selected foreground can support
+        // the diagnostic's explanation and remediation.
+        switch foregroundSource {
+        case .ansi256, .trueColor:
+            break
+        case .defaultForeground, .defaultBackground,
+             .invertedDefaultForeground, .invertedDefaultBackground:
+            return
+        }
+        // Default text is overwhelmingly the common case. Qualify the explicit source first so
+        // ordinary rows never even pay for the bounded string scan.
+        guard containsMeaningfulText(string) else { return }
+
+        let backgroundSource = renderedColorSource(
+            background,
+            isForeground: false,
+            isBold: false
+        )
+        var foregroundColor = mapColor(
+            color: foreground,
+            isFg: true,
+            isBold: isBold,
+            useBrightColors: useBrightColors
+        )
+        let backgroundColor = mapColor(
+            color: background,
+            isFg: false,
+            isBold: false
+        )
+        if attribute.style.contains(.dim) {
+            foregroundColor = foregroundColor.withAlphaComponent(
+                foregroundColor.alphaComponent * 0.5
+            )
+        }
+
+        guard let backgroundRGB = backgroundColor.usingColorSpace(.sRGB),
+              let foregroundRGB = foregroundColor.usingColorSpace(.sRGB)
+        else { return }
+
+        let flattenedForeground = composite(foregroundRGB, over: backgroundRGB)
+        let renderedForeground = renderedColor(flattenedForeground)
+        let renderedBackground = renderedColor(backgroundRGB)
+        let pair = TerminalTextContrastPair(
+            foregroundSource: foregroundSource,
+            backgroundSource: backgroundSource,
+            foreground: renderedForeground,
+            background: renderedBackground
+        )
+        guard !evaluatedTextContrast.contains(pair) else { return }
+        insertBounded(pair, into: &evaluatedTextContrast, limit: 256)
+
+        let ratio = contrastRatio(flattenedForeground, backgroundRGB)
+        guard ratio < 1.25 else { return }
+
+        guard !reportedTextContrast.contains(pair) else { return }
+        insertBounded(pair, into: &reportedTextContrast, limit: 64)
+
+        onLowContrastText(TerminalTextColorConflict(
+            foregroundSource: foregroundSource,
+            backgroundSource: backgroundSource,
+            foreground: renderedForeground,
+            background: renderedBackground,
+            contrastRatio: ratio,
+            sample: contrastSample(from: string)
+        ))
+    }
+
+    /// The run's own text, reduced to something the app may quote back at the reader.
+    ///
+    /// A diagnostic that only names two hex values leaves the person guessing which part of the
+    /// screen went missing, and the answer is right here in the run being measured. It is still
+    /// program output, so it is treated as such: control characters are dropped rather than
+    /// rendered as chrome, whitespace runs collapse, and both the scan and the result are
+    /// bounded — the scan because a run is as long as the terminal is wide, the result because a
+    /// notice band has one sentence to spend.
+    private func contrastSample(from string: String) -> String {
+        var kept: [Unicode.Scalar] = []
+        var scanned = 0
+        var pendingSpace = false
+        var truncated = false
+
+        for scalar in string.unicodeScalars {
+            scanned += 1
+            // The scan bound ends the sample without claiming anything was cut. A row is padded
+            // to its width, so a short label inside a long run reaches this having kept
+            // everything there was to keep — and "hello…" would say the opposite. The character
+            // bound is the one that means text was dropped, and being the smaller of the two it
+            // is what any run with more words than the band can hold reaches first.
+            if scanned > TerminalContrastSample.scanLimit { break }
+            if CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                // Leading whitespace is dropped; interior whitespace becomes one space, and
+                // only if something follows it.
+                pendingSpace = !kept.isEmpty
+                continue
+            }
+            guard !CharacterSet.controlCharacters.contains(scalar) else { continue }
+            guard kept.count + (pendingSpace ? 1 : 0) < TerminalContrastSample.characterLimit else {
+                truncated = true
+                break
+            }
+            if pendingSpace {
+                kept.append(" ")
+                pendingSpace = false
+            }
+            kept.append(scalar)
+        }
+
+        guard !kept.isEmpty else { return "" }
+        var sample = String(String.UnicodeScalarView(kept))
+        if truncated { sample.append(TerminalContrastSample.ellipsis) }
+        return sample
+    }
+
+    private func containsMeaningfulText(_ string: String) -> Bool {
+        var sampled = 0
+        var printable = 0
+        var containsLetterOrNumber = false
+        for scalar in string.unicodeScalars {
+            sampled += 1
+            if !CharacterSet.whitespacesAndNewlines.contains(scalar) {
+                printable += 1
+                containsLetterOrNumber = containsLetterOrNumber
+                    || CharacterSet.alphanumerics.contains(scalar)
+            }
+            if printable >= 4, containsLetterOrNumber { return true }
+            if sampled >= 64 { return false }
+        }
+        return false
+    }
+
+    private func renderedColorSource(
+        _ color: Attribute.Color,
+        isForeground: Bool,
+        isBold: Bool
+    ) -> TerminalRenderedColorSource {
+        switch color {
+        case .ansi256(let rawIndex):
+            let index: UInt8
+            if useBrightColors, rawIndex < 8, isBold {
+                index = rawIndex + 8
+            } else if !useBrightColors, rawIndex > 7 {
+                index = rawIndex - 8
+            } else {
+                index = rawIndex
+            }
+            return .ansi256(index: index)
+        case .trueColor(let red, let green, let blue):
+            return .trueColor(red: red, green: green, blue: blue)
+        case .defaultColor:
+            return isForeground ? .defaultForeground : .defaultBackground
+        case .defaultInvertedColor:
+            return isForeground ? .invertedDefaultForeground : .invertedDefaultBackground
+        }
+    }
+
+    private func composite(_ foreground: NSColor, over background: NSColor) -> NSColor {
+        let alpha = foreground.alphaComponent
+        guard alpha < 1 else { return foreground }
+        return NSColor(
+            srgbRed: foreground.redComponent * alpha + background.redComponent * (1 - alpha),
+            green: foreground.greenComponent * alpha + background.greenComponent * (1 - alpha),
+            blue: foreground.blueComponent * alpha + background.blueComponent * (1 - alpha),
+            alpha: 1
+        )
+    }
+
+    private func contrastRatio(_ first: NSColor, _ second: NSColor) -> Double {
+        func luminance(_ color: NSColor) -> Double {
+            func linear(_ component: CGFloat) -> Double {
+                let value = Double(component)
+                return value <= 0.04045
+                    ? value / 12.92
+                    : pow((value + 0.055) / 1.055, 2.4)
+            }
+            return 0.2126 * linear(color.redComponent)
+                + 0.7152 * linear(color.greenComponent)
+                + 0.0722 * linear(color.blueComponent)
+        }
+        let firstLuminance = luminance(first)
+        let secondLuminance = luminance(second)
+        return (max(firstLuminance, secondLuminance) + 0.05)
+            / (min(firstLuminance, secondLuminance) + 0.05)
+    }
+
+    private func renderedColor(_ color: NSColor) -> TerminalRenderedColor {
+        func byte(_ value: CGFloat) -> UInt8 {
+            UInt8(max(0, min(255, Int((value * 255).rounded()))))
+        }
+        return TerminalRenderedColor(
+            red: byte(color.redComponent),
+            green: byte(color.greenComponent),
+            blue: byte(color.blueComponent)
+        )
+    }
+
+    private func insertBounded<T: Hashable>(_ value: T, into set: inout Set<T>, limit: Int) {
+        if set.count >= limit, let existingValue = set.first {
+            set.remove(existingValue)
+        }
+        set.insert(value)
+    }
+    #endif
     
     /// Apply selection attributes
     /// TODO: Optimize the logic below
-    func updateSelectionAttributesIfNeeded(attributedLine attributedString: NSMutableAttributedString, row: Int, cols: Int) {
+    func updateSelectionAttributesIfNeeded(
+        attributedLine attributedString: NSMutableAttributedString,
+        row: Int,
+        cols: Int,
+        cellUTF16Offsets: [Int]
+    ) {
         guard let selection = self.selection, selection.active else {
             attributedString.removeAttribute(.selectionBackgroundColor)
             return
@@ -515,10 +923,26 @@ extension TerminalView {
             assert (selectionRange.length >= 0)
             if (selectionRange.location + selectionRange.length >= cols) {
             }
-            if row == 1 {
-                print(selectionRange)
-            }
-            attributedString.addAttribute(.selectionBackgroundColor, value: selectedTextBackgroundColor, range: selectionRange)
+            let startCell = min(selectionRange.location, cols)
+            let endCell = min(selectionRange.location + selectionRange.length, cols)
+            guard cellUTF16Offsets.indices.contains(startCell),
+                  cellUTF16Offsets.indices.contains(endCell)
+            else { return }
+
+            let renderedStart = cellUTF16Offsets[startCell]
+            let renderedEnd = cellUTF16Offsets[endCell]
+            let renderedRange = NSRange(
+                location: renderedStart,
+                length: renderedEnd - renderedStart
+            )
+            guard renderedRange.length > 0,
+                  renderedRange.location + renderedRange.length <= attributedString.length
+            else { return }
+            attributedString.addAttribute(
+                .selectionBackgroundColor,
+                value: selectedTextBackgroundColor,
+                range: renderedRange
+            )
         }
     }
 
@@ -672,20 +1096,19 @@ extension TerminalView {
             let lineInfo = buildAttributedString(row: row, line: line, cols: terminal.cols)
             let ctline = CTLineCreateWithAttributedString(lineInfo.attrStr)
 
+            let runs = CTLineGetGlyphRuns(ctline) as? [CTRun] ?? []
+
+            // The line is drawn in two passes — every run's background first, then every
+            // run's glyphs — because glyphs overhang their own run's cells: a wide emoji's
+            // bitmap spans two columns while its pad cell often shapes into the *next*
+            // run, and an interleaved background fill there would erase the glyph's right
+            // half. (Upstream interleaves but fills with .destinationOver over a
+            // transparent base; our opaque pre-fill for emoji compositing rules that out —
+            // see EmojiFixedTerminalView.)
             var col = 0
-            for run in CTLineGetGlyphRuns(ctline) as? [CTRun] ?? [] {
+            for run in runs {
                 let runGlyphsCount = CTRunGetGlyphCount(run)
                 let runAttributes = CTRunGetAttributes(run) as? [NSAttributedString.Key: Any] ?? [:]
-                let runFont = runAttributes[.font] as! TTFont
-
-                let runGlyphs = [CGGlyph](unsafeUninitializedCapacity: runGlyphsCount) { (bufferPointer, count) in
-                    CTRunGetGlyphs(run, CFRange(), bufferPointer.baseAddress!)
-                    count = runGlyphsCount
-                }
-
-                var positions = runGlyphs.enumerated().map { (i: Int, glyph: CGGlyph) -> CGPoint in
-                    CGPoint(x: lineOrigin.x + (cellDimension.width * CGFloat(col + i)), y: lineOrigin.y + yOffset)
-                }
 
                 var backgroundColor: TTColor?
                 if runAttributes.keys.contains(.selectionBackgroundColor) {
@@ -702,7 +1125,8 @@ extension TerminalView {
                     context.setLineWidth(0)
                     context.setFillColor(backgroundColor.cgColor)
 
-                    let transform = CGAffineTransform (translationX: positions[0].x, y: 0)
+                    let runStartX = lineOrigin.x + (cellDimension.width * CGFloat(col))
+                    let transform = CGAffineTransform (translationX: runStartX, y: 0)
 
                     var size = CGSize (width: CGFloat (cellDimension.width * CGFloat(runGlyphsCount)), height: cellDimension.height)
                     var origin: CGPoint = lineOrigin
@@ -720,14 +1144,28 @@ extension TerminalView {
                     if col + runGlyphsCount >= terminal.cols {
                         size.width += frame.width - size.width
                     }
-                    
+
                     let rect = CGRect (origin: origin, size: size)
-                    #if os(macOS)
-                    rect.applying(transform).fill(using: .destinationOver)
-                    #else
                     context.fill(rect.applying(transform))
-                    #endif
                     context.restoreGState()
+                }
+
+                col += runGlyphsCount
+            }
+
+            col = 0
+            for run in runs {
+                let runGlyphsCount = CTRunGetGlyphCount(run)
+                let runAttributes = CTRunGetAttributes(run) as? [NSAttributedString.Key: Any] ?? [:]
+                let runFont = runAttributes[.font] as! TTFont
+
+                let runGlyphs = [CGGlyph](unsafeUninitializedCapacity: runGlyphsCount) { (bufferPointer, count) in
+                    CTRunGetGlyphs(run, CFRange(), bufferPointer.baseAddress!)
+                    count = runGlyphsCount
+                }
+
+                var positions = runGlyphs.enumerated().map { (i: Int, glyph: CGGlyph) -> CGPoint in
+                    CGPoint(x: lineOrigin.x + (cellDimension.width * CGFloat(col + i)), y: lineOrigin.y + yOffset)
                 }
 
                 nativeForegroundColor.set()
@@ -740,7 +1178,7 @@ extension TerminalView {
                     }
                     context.setFillColor(cgColor)
                 }
-                
+
                 CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
 
                 // Draw other attributes
@@ -1037,7 +1475,6 @@ extension TerminalView {
         let oldPosition = terminal.buffer.yDisp
         
         let maxScrollback = terminal.buffer.lines.count - terminal.rows
-        print ("maxScrollBack: \(maxScrollback)")
         var newScrollPosition = Int (Double (maxScrollback) * toPosition)
         
         if newScrollPosition < 0 {
@@ -1046,8 +1483,6 @@ extension TerminalView {
         if newScrollPosition > maxScrollback {
             newScrollPosition = maxScrollback
         }
-        print ("newScrollpsitin: \(newScrollPosition)")
-        
         if newScrollPosition != oldPosition {
             scrollTo(row: newScrollPosition)
         }
@@ -1057,9 +1492,15 @@ extension TerminalView {
     func scrollTo (row: Int, notifyAccessibility: Bool = true)
     {
         if row != terminal.buffer.yDisp {
-            
+
             terminal.buffer.yDisp = row
-            
+
+            // Tell the terminal whether the viewport is being held above the live output.
+            // Without this, `Terminal.scroll` resets yDisp to the bottom on every write, so
+            // any program that repaints — a full-screen TUI redrawing on hover, say — yanks
+            // the view back down as fast as it can be scrolled up.
+            terminal.userScrolling = row < terminal.buffer.yBase
+
             // tell the terminal we want to refresh all the rows
             terminal.refresh (startRow: 0, endRow: terminal.rows)
             
@@ -1109,7 +1550,13 @@ extension TerminalView {
     func feedPrepare()
     {
         search.invalidate()
+        // AppKit selections are buffer ranges, so ordinary process output can leave them intact.
+        // The macOS front end clears only when an operation invalidates those coordinates
+        // (buffer switch, resize, fixed-buffer scroll, or scrollback trim). UIKit's selection
+        // handles keep their existing output-cancels-selection contract.
+        #if os(iOS) || os(visionOS)
         selection.active = false
+        #endif
         startDisplayUpdates()
     }
     
@@ -1343,3 +1790,45 @@ extension TerminalView {
     
 }
 #endif
+
+/// The rate at which wheel reports may be written to a pty, and the bucket that spends them.
+///
+/// A pty carries no message boundaries and its input queue fills a byte at a time, so a program
+/// that is mid-render when reports arrive resumes reading in the *middle* of one; a stdin parser
+/// that does not carry a partial escape sequence across reads then drops the orphaned `ESC [ <`
+/// and takes the rest for typing. Measured against a reader on a 40ms frame: at 100 reports a
+/// second every one of its `read`s still began on a report boundary after an 800ms stall; at 180
+/// a second an 800ms stall split one; at 300 a second 400ms was enough.
+///
+/// One implementation with two owners — a Mac wheel and a phone's finger report the same way, so
+/// the measured numbers cannot drift apart between them.
+public struct WheelReportBudget {
+
+    /// Reports a second the program on the other end keeps up with.
+    public static let reportsPerSecond: Double = 100
+
+    /// The most reports one gesture may put out at once, so a deliberate notch still moves the
+    /// application's view immediately while a flick cannot open the tap.
+    public static let burst: Double = 6
+
+    private var allowance: Double = WheelReportBudget.burst
+    private var stamp: DispatchTime = DispatchTime.now()
+
+    public init () {}
+
+    /// Takes up to `wanted` reports out of the budget, refilling it for the time elapsed since
+    /// the last one. Nothing banks past the burst, so a pause cannot buy a flood.
+    public mutating func grant (_ wanted: Int) -> Int {
+        let now = DispatchTime.now()
+        let elapsed = Double (now.uptimeNanoseconds &- stamp.uptimeNanoseconds) / 1_000_000_000
+        stamp = now
+
+        allowance = min (
+            WheelReportBudget.burst,
+            allowance + elapsed * WheelReportBudget.reportsPerSecond
+        )
+        let granted = min (wanted, Int (allowance))
+        allowance -= Double (granted)
+        return granted
+    }
+}

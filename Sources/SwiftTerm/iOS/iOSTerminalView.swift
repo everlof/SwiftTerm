@@ -16,10 +16,6 @@ import Foundation
 import UIKit
 import CoreText
 import CoreGraphics
-import os
-
-@available(iOS 14.0, *)
-internal var log: Logger = Logger(subsystem: "org.tirania.SwiftTerm", category: "msg")
 
 /**
  * TerminalView provides an AppKit/UIKit front-end to the `Terminal` terminal emulator.
@@ -102,7 +98,28 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      * The delegate that the TerminalView uses to interact with its hosting
      */
     public weak var terminalDelegate: TerminalViewDelegate?
-    
+
+    /**
+     * Gives a subclass a chance to keep the emulator on an explicitly managed grid, one that
+     * does not follow this view's pixel size.
+     *
+     * Called before the emulator is touched, so returning false suppresses the whole of the
+     * frame-driven resize: no reflow of the buffer, no soft reset, and no delegate
+     * notification. The default preserves SwiftTerm behaviour.
+     */
+    open func shouldApplyFrameSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
+    /**
+     * Gives a subclass a chance to keep a programmatic emulator resize local to the renderer.
+     * Internal scrolling and accessibility state are still updated; only the host delegate
+     * notification is suppressed. The default preserves SwiftTerm behaviour.
+     */
+    open func shouldReportSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
     /**
      * If set, and the the client application has requested mouse events to be sent, this will
      * send the events.   If this value if false, then a secondary codepath is enabled that will
@@ -115,7 +132,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      * If a client application has not indicated any use for mouse events, then this setting
      * does not do anything, and selection and panning are still processed.
      */
-    public var allowMouseReporting: Bool = true
+    public var allowMouseReporting: Bool = true {
+        didSet {
+            guard allowMouseReporting != oldValue else { return }
+            // The touch mapping is part of this answer: with a tracking program the one-finger
+            // pan belongs to it and the scroll view is left the two-finger one. A host that
+            // will not forward reports has to get its finger back, or the gesture is claimed
+            // and then dropped and nothing scrolls at all.
+            mouseModeChanged (source: terminal)
+        }
+    }
     
     /**
      * If set, this turns Option-letter keystrokes into an escape + keystroke combination
@@ -402,6 +428,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// - Returns: both the position where the event took place (either in screen resolution, or buffer relative) and the pixel position to construct the menu location
     func calculateTapHit (gesture: UIGestureRecognizer) -> (grid: Position, pixels: Position)
     {
+        calculateTapHit (point: gesture.location(in: self))
+    }
+
+    /// The same answer for a point this view already holds, so a host that routes a tap itself
+    /// does not have to manufacture a gesture recognizer to ask.
+    func calculateTapHit (point: CGPoint) -> (grid: Position, pixels: Position)
+    {
         func toInt (_ p: CGPoint) -> Position {
             
             let x = min (max (p.x, 0), bounds.width)
@@ -409,7 +442,6 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return Position (col: Int (x), row: Int (y))
         }
 
-        let point = gesture.location(in: self)
         let col = Int (point.x / cellDimension.width)
         let row = Int (point.y / cellDimension.height)
         if row < 0 {
@@ -421,7 +453,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     func encodeFlags (release: Bool) -> Int
     {
         let encodedFlags = terminal.encodeButton(
-            button: 1,
+            // Button zero, the left one. `encodeButton` takes xterm's own numbering, where 1 is
+            // the *middle* button — the Mac passes `NSEvent.buttonNumber`, which is 0 for a
+            // left click, and this passed 1. So every tap reached the program as a middle
+            // click, which a TUI that offers something to click on ignores: the phone was
+            // reporting a button nobody listens for.
+            button: 0,
             release: release,
             shift: false,
             meta: false,
@@ -432,10 +469,40 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     func sharedMouseEvent (gestureRecognizer: UIGestureRecognizer, release: Bool)
     {
-        let hit = calculateTapHit(gesture: gestureRecognizer)
+        sharedMouseEvent (at: gestureRecognizer.location(in: self), release: release)
+    }
+
+    func sharedMouseEvent (at point: CGPoint, release: Bool)
+    {
+        let hit = calculateTapHit(point: point)
         if let grid = hit.grid.toScreenCoordinate(from: terminal.buffer) {
             terminal.sendEvent(buttonFlags: encodeFlags (release: release), x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
         }
+    }
+
+    /// The size one character cell occupies, which is what turns a point into a cell.
+    ///
+    /// Public because `forwardTap(at:)` is: a host that routes its own taps has to be able to
+    /// say where one landed, and the grid it lands on may be the size of another machine's.
+    public var cellSize: CGSize {
+        CGSize (width: cellDimension.width, height: cellDimension.height)
+    }
+
+    /// Reports the click a tap at `point` stands for, and says whether anything wanted it.
+    ///
+    /// The press and its release travel together: a tap has no dwell, and a program told only
+    /// that a button went down waits for a release that a finger never sends. `false` means no
+    /// program is tracking the mouse, so the caller still owns the gesture.
+    @discardableResult
+    public func forwardTap (at point: CGPoint) -> Bool {
+        guard allowMouseReporting && terminal.mouseMode.sendButtonPress() else { return false }
+
+        sharedMouseEvent (at: point, release: false)
+        if terminal.mouseMode.sendButtonRelease() {
+            sharedMouseEvent (at: point, release: true)
+        }
+        queuePendingDisplay()
+        return true
     }
     
     // Returns the offsets into getTerminal().buffer.lines for the first visible and last visible lines
@@ -453,65 +520,77 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         contentOffset.y = max(0, CGFloat(lines) - bottomVisibleLine) * cellDimension.height
     }
     
+    /// A tap over a program that tracks the mouse is that program's click, whether or not this
+    /// view is holding the keyboard.
+    ///
+    /// Gating the whole gesture on first responder spent the first tap after the keyboard was
+    /// put away on taking it back, so a phone reading a full-screen TUI could never reach the
+    /// affordances the TUI draws — Claude Code's "click to go to bottom" among them. Taking the
+    /// keyboard here instead would cover the thing just clicked, so the click is reported and
+    /// focus is left where the person put it; the host offers its own control for asking the
+    /// keyboard back.
     @objc func singleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
-        if isFirstResponder {
-            guard gestureRecognizer.view != nil else { return }
-                 
-            if gestureRecognizer.state != .ended {
-                return
-            }
-            
-            if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
-                sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
+        guard gestureRecognizer.view != nil else { return }
 
-                if terminal.mouseMode.sendButtonRelease() {
-                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
-                }
-            } else {
-                if selection.active {
-                    selection.selectNone()
-                    disableSelectionPanGesture()
-                }
-                if UIMenuController.shared.isMenuVisible {
-                    UIMenuController.shared.hideMenu()
-                } else {
-                    let location = gestureRecognizer.location(in: gestureRecognizer.view)
-                    let tapLoc = calculateTapHit(gesture: gestureRecognizer).grid
-                    let cursorRow = terminal.buffer.y+terminal.buffer.yDisp
-                    if abs (tapLoc.col-terminal.buffer.x) < 4 && abs (tapLoc.row - cursorRow) < 2 {
-                        showContextMenu (forRegion: makeContextMenuRegionForTap (point: location), pos: tapLoc)
-                    }
-                }
-            }
-            queuePendingDisplay()
-        } else {
-            let _ = becomeFirstResponder ()
+        if gestureRecognizer.state != .ended {
+            return
         }
+
+        if forwardTap (at: gestureRecognizer.location(in: self)) {
+            return
+        }
+
+        guard isFirstResponder else {
+            let _ = becomeFirstResponder ()
+            return
+        }
+
+        if selection.active {
+            selection.selectNone()
+            disableSelectionPanGesture()
+        }
+        if UIMenuController.shared.isMenuVisible {
+            UIMenuController.shared.hideMenu()
+        } else {
+            let location = gestureRecognizer.location(in: gestureRecognizer.view)
+            let tapLoc = calculateTapHit(gesture: gestureRecognizer).grid
+            // The cursor's absolute row is fixed to the live screen, so it is `yBase`
+            // it is measured from — `yDisp` is wherever the viewport has been scrolled.
+            let cursorRow = terminal.buffer.y+terminal.buffer.yBase
+            if abs (tapLoc.col-terminal.buffer.x) < 4 && abs (tapLoc.row - cursorRow) < 2 {
+                showContextMenu (forRegion: makeContextMenuRegionForTap (point: location), pos: tapLoc)
+            }
+        }
+        queuePendingDisplay()
     }
     
     @objc func doubleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
         guard gestureRecognizer.view != nil else { return }
-               
+
         if gestureRecognizer.state != .ended {
             return
         }
-        
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
-            sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
-            
-            if terminal.mouseMode.sendButtonRelease() {
-                sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
-            }
+
+        // Over a tracking program a single tap is that program's click, so a double tap is the
+        // finger's deliberate ask for the keyboard. The pair's first tap already reached the
+        // program through the single-tap recognizer — repeating the same click cannot be what
+        // a second tap in the same spot meant.
+        if !isFirstResponder && allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+            let _ = becomeFirstResponder ()
             return
-        } else {
-            let hit = calculateTapHit(gesture: gestureRecognizer).grid
-            selection.selectWordOrExpression(at: hit, in: terminal.buffer)
-            enableSelectionPanGesture()
-            showContextMenu (forRegion: makeContextMenuRegionForSelection(), pos: hit)
-            queuePendingDisplay()
         }
+
+        if forwardTap (at: gestureRecognizer.location(in: self)) {
+            return
+        }
+
+        let hit = calculateTapHit(gesture: gestureRecognizer).grid
+        selection.selectWordOrExpression(at: hit, in: terminal.buffer)
+        enableSelectionPanGesture()
+        showContextMenu (forRegion: makeContextMenuRegionForSelection(), pos: hit)
+        queuePendingDisplay()
     }
     
     var directionView: UIView?
@@ -570,7 +649,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             sendKeyRight()
         }
         if imgName == nil {
-            print ("What?")
+            SwiftTermDiagnostics.emit(.fault, .uiDirectionKeyInvariant)
         }
         guard let name = imgName else { return }
 
@@ -592,29 +671,72 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         imgView.tintColor = .white
     }
     
+    /// Leftover drag distance not yet worth a whole line to report.
+    var wheelDragAccumulator: CGFloat = 0
+
+    /// The measured rate wheel reports may be written at, shared with the Mac view.
+    var wheelBudget = WheelReportBudget()
+
+    /// A one-finger drag over a program that tracks the mouse.
+    ///
+    /// It reports the drag as **wheel** buttons rather than as a press and motion. A finger is
+    /// this device's wheel: a full-screen program scrolls its own content when it is told the
+    /// wheel turned — Claude Code moves its transcript that way, which is the only way to reach
+    /// history it has already scrolled past — whereas the press-and-drag this used to send is a
+    /// selection gesture that leaves the content exactly where it was. That is why scrolling a
+    /// mirrored agent TUI from the phone did nothing at all. The Mac has reported the wheel
+    /// since `MacTerminalView.scrollWheel`; this is the same routing with a finger for a wheel,
+    /// and two fingers left over for the local scrollback the same way option-wheel is on the Mac.
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer){
         guard gestureRecognizer.view != nil else { return }
-        if allowMouseReporting && terminal.mouseMode != .off {
-            switch gestureRecognizer.state {
-            case .began:
-                // send the initial tap
-                if terminal.mouseMode.sendButtonPress() {
-                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
-                }
-            case .ended, .cancelled:
-                if terminal.mouseMode.sendButtonRelease() {
-                    sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: true)
-                }
-            case .changed:
-                if terminal.mouseMode.sendButtonTracking() {
-                    let hit = calculateTapHit(gesture: gestureRecognizer)
-                    if let grid = hit.grid.toScreenCoordinate(from: terminal.buffer) {
-                        terminal.sendMotion(buttonFlags: encodeFlags(release: false), x: grid.col, y: grid.row, pixelX: hit.pixels.col, pixelY: hit.pixels.row)
-                    }
-                }
-            default:
-                break
-            }
+        guard allowMouseReporting && terminal.mouseMode != .off else { return }
+        switch gestureRecognizer.state {
+        case .began:
+            // A new gesture starts fresh, so leftovers cannot accumulate into a jump.
+            wheelDragAccumulator = 0
+        case .changed:
+            let travelled = gestureRecognizer.translation(in: self).y
+            gestureRecognizer.setTranslation(.zero, in: self)
+            forwardWheelDrag (distance: travelled, gestureRecognizer: gestureRecognizer)
+        default:
+            break
+        }
+    }
+
+    /// Reports `distance` points of drag to the application as wheel presses (64/65), one per
+    /// whole line travelled and no faster than the program on the other end reads them. Reports
+    /// past the budget are dropped rather than queued: a scroll the application never saw is a
+    /// scroll that did not happen, and the rest of the gesture already says where to be.
+    public func forwardWheelDrag (distance: CGFloat, gestureRecognizer: UIGestureRecognizer) {
+        let cellHeight = cellDimension.height
+        guard cellHeight > 0 else { return }
+
+        wheelDragAccumulator += distance
+        let lines = Int (wheelDragAccumulator / cellHeight)
+        guard lines != 0 else { return }
+        wheelDragAccumulator -= CGFloat (lines) * cellHeight
+
+        let reports = wheelBudget.grant (min (abs (lines), Int (WheelReportBudget.burst)))
+        guard reports > 0 else { return }
+
+        let hit = calculateTapHit (gesture: gestureRecognizer)
+        guard let grid = hit.grid.toScreenCoordinate (from: terminal.buffer) else { return }
+        // Dragging the content down asks for what is above it, which is the wheel turning up.
+        let flags = terminal.encodeButton (
+            button: lines > 0 ? 4 : 5,
+            release: false,
+            shift: false,
+            meta: false,
+            control: false
+        )
+        for _ in 0..<reports {
+            terminal.sendEvent (
+                buttonFlags: flags,
+                x: grid.col,
+                y: grid.row,
+                pixelX: hit.pixels.col,
+                pixelY: hit.pixels.row
+            )
         }
     }
    
@@ -701,14 +823,22 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
     
-    var panMouseGesture: UIPanGestureRecognizer?
+    public private(set) var panMouseGesture: UIPanGestureRecognizer?
+
+    /// Hands one finger to the application and keeps two for the local scrollback.
+    ///
+    /// Both gestures live on this same scroll view, and two pan recognizers on one view do not
+    /// both get to recognise: without the touch count telling them apart, whichever won took the
+    /// drag and the other behaviour became unreachable. Two fingers is this device's option-wheel.
     func enableMousePanGesture () {
         guard panMouseGesture == nil else {
             return
         }
         let gesture = UIPanGestureRecognizer (target: self, action: #selector(panMouseHandler))
+        gesture.maximumNumberOfTouches = 1
         addGestureRecognizer(gesture)
         panMouseGesture = gesture
+        panGestureRecognizer.minimumNumberOfTouches = 2
     }
     
     func disableMousePanGesture () {
@@ -717,6 +847,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
         removeGestureRecognizer(gesture)
         panMouseGesture = nil
+        panGestureRecognizer.minimumNumberOfTouches = 1
     }
     
     var panSelectionGesture: UIPanGestureRecognizer?
@@ -816,6 +947,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     var _nativeFg, _nativeBg: TTColor!
     var settingFg = false, settingBg = false
+    var _nativeBoldFg: UIColor?
     /**
      * This will set the native foreground color to the specified native color (UIColor or NSColor)
      * and will have this reflected into the underlying's terminal `foregroundColor` and
@@ -847,6 +979,32 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             colorsChanged()
             settingBg = false
         }
+    }
+
+    /// **Ours.** The colour bold text drawn with the *default* foreground is rendered in —
+    /// Terminal.app's "Bold Text" — or nil to draw it in `nativeForegroundColor`, which is what
+    /// SwiftTerm did before this existed.
+    ///
+    /// Bold text that names an ANSI colour is unaffected: it keeps the 0–7 to 8–15 bright shift.
+    public var nativeBoldForegroundColor: UIColor? {
+        get { _nativeBoldFg }
+        set {
+            guard _nativeBoldFg != newValue else { return }
+            _nativeBoldFg = newValue
+            // The attribute caches resolved the bold styles through the old answer.
+            attributes = [:]
+            urlAttributes = [:]
+            terminal.updateFullScreen ()
+            queuePendingDisplay ()
+        }
+    }
+
+    /// **Ours.** The colour this attribute's text is drawn in, after inverse, the bold
+    /// foreground, bold-as-bright and SGR 2 faintness have all resolved. A seam for the
+    /// embedder's tests; the renderer itself uses the same call.
+    public func resolvedForegroundColor (for attribute: Attribute) -> UIColor
+    {
+        resolvedForeground (for: attribute)
     }
 
     /// Controls the color for the caret
@@ -892,6 +1050,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var lineLeading: CGFloat = 0
     
     open func bufferActivated(source: Terminal) {
+        // A buffer switch has no scroll position worth keeping: the alternate buffer has no
+        // scrollback at all, and coming back from one lands on the live tail.
+        source.userScrolling = false
         updateScroller ()
     }
     
@@ -976,14 +1137,79 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         disableSelectionPanGesture()
     }
     
+    /// The offset this view last put there itself, so a later one that differs can only have
+    /// come from the person dragging.
+    var appliedOffsetY: CGFloat = 0
+
+    /// `buffer.linesTop` as of the last `updateScroller`. It counts the lines the emulator has
+    /// dropped off the top of its scrollback, which is how far the text under a held viewport
+    /// has moved since.
+    var reportedLinesTop = 0
+
     func updateScroller ()
     {
+        let cellHeight = cellDimension.height
         contentSize = CGSize (width: CGFloat (terminal.buffer.cols) * cellDimension.width,
-                              height: CGFloat (terminal.buffer.lines.count) * cellDimension.height)
-        //contentOffset = CGPoint (x: 0, y: CGFloat (terminal.buffer.lines.count-terminal.rows)*cellDimension.height)
-        contentOffset = CGPoint (x: 0, y: CGFloat (terminal.buffer.lines.count-terminal.rows)*cellDimension.height)
-        //Xscroller.doubleValue = scrollPosition
-        //Xscroller.knobProportion = scrollThumbsize
+                              height: CGFloat (terminal.buffer.lines.count) * cellHeight)
+
+        let trimmed = terminal.buffer.linesTop - reportedLinesTop
+        reportedLinesTop = terminal.buffer.linesTop
+
+        // A drag and the momentum after it own the offset outright: assigning to
+        // `contentOffset` under a live gesture stops deceleration dead. The text still slides
+        // up as the emulator trims its scrollback, so the offset follows it by that many lines
+        // and the line being read stays under the finger.
+        if isTracking || isDragging || isDecelerating {
+            if trimmed > 0 {
+                setContentOffsetY (max (0, contentOffset.y - CGFloat (trimmed) * cellHeight))
+            }
+            return
+        }
+
+        // `yDisp` is the first visible row, and the emulator holds it above the live tail for
+        // as long as `terminal.userScrolling` is set. Following it here is what lets a scroll
+        // back survive output. Pinning to `lines.count - rows` instead — which is where the
+        // bottom is, unconditionally — is what made a streaming agent impossible to read back
+        // through on iOS: every line written yanked the viewport down again, faster than a
+        // finger can drag it up. The Mac side has had the `userScrolling` seam all along.
+        setContentOffsetY (CGFloat (terminal.buffer.yDisp) * cellHeight)
+    }
+
+    /// Moves the viewport and records that this view, rather than the person holding it, is
+    /// what moved it.
+    func setContentOffsetY (_ y: CGFloat)
+    {
+        appliedOffsetY = y
+        contentOffset = CGPoint (x: 0, y: y)
+    }
+
+    open override func layoutSubviews ()
+    {
+        super.layoutSubviews ()
+        trackScrollPosition ()
+    }
+
+    /// Mirrors an offset this view did not set back into the emulator. `yDisp` is what
+    /// selection, mouse reporting and the caret read as the first visible row, and
+    /// `terminal.userScrolling` is what keeps `Terminal.scroll` from resetting it to the live
+    /// tail on the very next write.
+    ///
+    /// UIScrollView calls `layoutSubviews` on every offset change, so this is the one place
+    /// that sees a drag, its momentum, and a host restoring a saved position alike. It is O(1)
+    /// on purpose: it runs once per scrolled frame.
+    func trackScrollPosition ()
+    {
+        guard terminal != nil else { return }
+        let cellHeight = cellDimension.height
+        guard cellHeight > 0 else { return }
+        guard abs (contentOffset.y - appliedOffsetY) > 0.5 else { return }
+        appliedOffsetY = contentOffset.y
+        guard !terminal.isCurrentBufferAlternate else { return }
+        let row = min (max (Int ((contentOffset.y / cellHeight).rounded ()), 0), terminal.buffer.yBase)
+        if row != terminal.buffer.yDisp {
+            terminal.buffer.yDisp = row
+        }
+        terminal.userScrolling = row < terminal.buffer.yBase
     }
     
     var userScrolling = false
@@ -1115,7 +1341,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     func ensureCaretIsVisible ()
     {
-        contentOffset = CGPoint (x: 0, y: CGFloat (terminal.buffer.lines.count-terminal.rows)*cellDimension.height)
+        // Typing rejoins the live tail. The emulator has to be told to stop holding `yDisp`
+        // above it as well, or the next line of output pulls the viewport straight back up to
+        // wherever the user had scrolled to.
+        terminal.userScrolling = false
+        terminal.buffer.yDisp = terminal.buffer.yBase
+        setContentOffsetY (CGFloat (terminal.buffer.lines.count-terminal.rows)*cellDimension.height)
     }
     
     public func deleteBackward() {
@@ -1286,7 +1517,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 data = .bytes ([0x1b])
                 
             case .keyboardInsert:
-                print (".keyboardInsert ignored")
+                SwiftTermDiagnostics.emit(.debug, .uiKeyboardInsertUnsupported)
                 break
                 
             case .keyboardReturn:
@@ -1428,7 +1659,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     open func mouseModeChanged(source: Terminal) {
-        if source.mouseMode != .off {
+        if allowMouseReporting && source.mouseMode != .off {
             enableMousePanGesture()
         } else {
             disableMousePanGesture()
@@ -1442,8 +1673,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
   
     open func sizeChanged(source: Terminal) {
+        let reportsSizeChange = shouldReportSizeChange(
+            newCols: source.cols,
+            newRows: source.rows
+        )
         DispatchQueue.main.async {
-            self.terminalDelegate?.sizeChanged(source: self, newCols: source.cols, newRows: source.rows)
+            if reportsSizeChange {
+                self.terminalDelegate?.sizeChanged(
+                    source: self,
+                    newCols: source.cols,
+                    newRows: source.rows
+                )
+            }
             self.updateScroller()
         }
     }

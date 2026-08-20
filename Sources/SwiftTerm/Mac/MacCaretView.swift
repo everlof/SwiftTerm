@@ -105,6 +105,7 @@ class CaretView: NSView, CALayerDelegate {
 
     func updateView() {
         setNeedsDisplay(bounds)
+        layer?.setNeedsDisplay()
     }
     
     func draw(_ layer: CALayer, in context: CGContext) {
