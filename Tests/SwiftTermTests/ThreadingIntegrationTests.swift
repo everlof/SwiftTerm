@@ -157,6 +157,11 @@ final class ThreadingIntegrationTests: XCTestCase {
         let view = CapturingTerminalView(
             frame: CGRect(origin: .zero, size: CGSize(width: 480, height: 240))
         )
+        XCTAssertEqual(view.scrollerStyle, .legacy)
+        XCTAssertEqual(
+            view.subviews.compactMap { $0 as? NSScroller }.first?.scrollerStyle,
+            .legacy
+        )
         for line in 0..<200 {
             view.feed(text: "line \(line)\r\n")
         }

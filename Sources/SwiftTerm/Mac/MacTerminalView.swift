@@ -1198,9 +1198,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
 
-    /// Style for the terminal's scroll indicator. Defaults to `.overlay` which auto-hides.
-    /// Set to `.legacy` for an always-visible scrollbar.
-    public var scrollerStyle: NSScroller.Style = .overlay {
+    /// Style for the terminal's scroll indicator. Threading reserves the legacy-width column and
+    /// lets its replacement scroller own fading without changing the terminal grid's width.
+    public var scrollerStyle: NSScroller.Style = .legacy {
         didSet {
             scroller?.scrollerStyle = scrollerStyle
             if let scroller {
