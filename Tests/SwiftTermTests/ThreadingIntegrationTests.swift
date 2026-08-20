@@ -16,6 +16,12 @@ final class ThreadingIntegrationTests: XCTestCase {
         return headless.terminal
     }
 
+    private func feedLines(_ terminal: Terminal, _ range: ClosedRange<Int>) {
+        for index in range {
+            terminal.feed(text: "line-\(index)\r\n")
+        }
+    }
+
     func testResizeDoesNotMaterializeEmptyScrollbackCapacity() {
         let terminal = terminal(rows: 24, scrollback: 10_000)
         let allocatedBefore = terminal.normalBuffer.lines.getArray().compactMap { $0 }.count
@@ -65,6 +71,74 @@ final class ThreadingIntegrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(text.utf8.count, 16)
         XCTAssertFalse(text.contains(".png"))
         XCTAssertFalse(text.contains("budget"))
+    }
+
+    func testIncrementalRecentBufferSkipsStableScrollback() {
+        let terminal = terminal(cols: 40, rows: 5, scrollback: 2_000)
+        feedLines(terminal, 1...300)
+        let first = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: 0
+        )
+
+        feedLines(terminal, 301...301)
+        let second = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: first.nextAbsoluteRow
+        )
+
+        XCTAssertTrue(second.text.contains("line-301"))
+        XCTAssertFalse(second.text.contains("line-100"))
+        XCTAssertLessThanOrEqual(
+            second.text.split(separator: "\n", omittingEmptySubsequences: false).count,
+            8
+        )
+    }
+
+    func testIncrementalRecentBufferAlwaysRereadsCurrentScreen() {
+        let terminal = terminal(cols: 40, rows: 5, scrollback: 2_000)
+        feedLines(terminal, 1...300)
+        let first = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: 0
+        )
+
+        terminal.feed(text: "\u{1b}[H/tmp/painted-in-place.png")
+        let second = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: first.nextAbsoluteRow
+        )
+
+        XCTAssertTrue(second.text.contains("/tmp/painted-in-place.png"))
+    }
+
+    func testIncrementalRecentBufferRejectsCursorPastResetBuffer() {
+        let terminal = terminal(cols: 40, rows: 5, scrollback: 2_000)
+        feedLines(terminal, 1...300)
+
+        let read = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: 10_000_000
+        )
+
+        XCTAssertTrue(read.text.contains("line-1\n"))
+    }
+
+    func testIncrementalRecentBufferCursorAdvancesWithProducedRows() {
+        let terminal = terminal(cols: 40, rows: 5, scrollback: 2_000)
+        feedLines(terminal, 1...10)
+        let first = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: 0
+        )
+
+        feedLines(terminal, 11...13)
+        let second = terminal.getRecentLogicalBufferText(
+            maximumUTF8Bytes: 256 * 1024,
+            sinceAbsoluteRow: first.nextAbsoluteRow
+        )
+
+        XCTAssertEqual(second.nextAbsoluteRow - first.nextAbsoluteRow, 3)
     }
 
     func testMouseProtocolAndColorSchemeReportingArePublicContracts() {

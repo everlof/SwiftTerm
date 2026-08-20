@@ -7153,6 +7153,21 @@ open class Terminal {
         return l
     }
     
+    /// A bounded read of recent buffer text, with the position a follow-up read resumes from.
+    public struct RecentBufferText: Equatable {
+        /// The recent complete logical lines, oldest first.
+        public let text: String
+        /// One past the newest row examined, counted from the first line the emulator ever
+        /// produced so the value survives scrollback trimming. Feed it back as
+        /// `sinceAbsoluteRow` to read only what has appeared since.
+        public let nextAbsoluteRow: Int
+
+        public init (text: String, nextAbsoluteRow: Int) {
+            self.text = text
+            self.nextAbsoluteRow = nextAbsoluteRow
+        }
+    }
+
     /// Specified the kind of buffer is being requested from the terminal
     public enum BufferKind {
         /// The currently active buffer (can be either normal or alt)
@@ -7231,16 +7246,72 @@ open class Terminal {
     public func getRecentLogicalBufferText(maximumUTF8Bytes: Int,
                                            kind: BufferKind = .active) -> String
     {
-        guard maximumUTF8Bytes > 0 else { return "" }
+        getRecentLogicalBufferText(
+            maximumUTF8Bytes: maximumUTF8Bytes,
+            sinceAbsoluteRow: 0,
+            kind: kind
+        ).text
+    }
+
+    /// The incremental form of `getRecentLogicalBufferText(maximumUTF8Bytes:kind:)`.
+    ///
+    /// The byte bound limits how much text is *returned*. It cannot limit how much is *read*: a
+    /// blank row costs one separator byte, and a terminal's scrollback is mostly blank and short
+    /// rows, so the budget is never spent and the walk reaches row zero. A caller polling a live
+    /// session therefore translated its entire scrollback on every pass to assemble a few tens of
+    /// kilobytes, on the thread the window draws on.
+    ///
+    /// `sinceAbsoluteRow` bounds the read instead. Pass back the `nextAbsoluteRow` of the previous
+    /// result and only rows that have appeared since are translated again.
+    ///
+    /// The current screen is always re-read regardless of `sinceAbsoluteRow`, because a
+    /// full-screen application repaints rows in place without scrolling. Rows above the screen
+    /// have scrolled out of reach of the cursor and can no longer change, which is what makes
+    /// skipping them safe rather than merely cheaper.
+    ///
+    /// Absolute row coordinates count from the first line the emulator ever produced, so they
+    /// survive scrollback trimming and a cursor stays valid while old lines fall off the top. A
+    /// cursor from a buffer that has since been cleared or switched is ignored.
+    ///
+    /// - Parameters:
+    ///   - maximumUTF8Bytes: The largest UTF-8 representation the result may have.
+    ///   - sinceAbsoluteRow: The absolute row the caller has already read through. Pass `0` to
+    ///     read the whole bounded window.
+    ///   - kind: Which terminal buffer to inspect.
+    public func getRecentLogicalBufferText (
+        maximumUTF8Bytes: Int,
+        sinceAbsoluteRow: Int,
+        kind: BufferKind = .active
+    ) -> RecentBufferText
+    {
         let inspectedBuffer = bufferFromKind(kind: kind)
-        guard inspectedBuffer.lines.count > 0 else { return "" }
+        let endAbsoluteRow = inspectedBuffer.linesTop + inspectedBuffer.lines.count
+        guard maximumUTF8Bytes > 0, inspectedBuffer.lines.count > 0 else {
+            return RecentBufferText(text: "", nextAbsoluteRow: endAbsoluteRow)
+        }
+
+        // A cursor past the end belongs to a buffer that has since been reset or switched. Read
+        // the whole window rather than nothing, so a reset cannot silently blind the caller.
+        let requested = sinceAbsoluteRow > endAbsoluteRow
+            ? inspectedBuffer.linesTop
+            : sinceAbsoluteRow
+        // Never below the oldest retained row, and never past the top of the screen.
+        let floorAbsoluteRow = min(
+            max(requested, inspectedBuffer.linesTop),
+            inspectedBuffer.linesTop + inspectedBuffer.yBase
+        )
+        let floorRow = max(
+            0,
+            min(floorAbsoluteRow - inspectedBuffer.linesTop,
+                inspectedBuffer.lines.count - 1)
+        )
 
         var logicalLinesNewestFirst: [[String]] = []
         var currentRowsNewestFirst: [String] = []
         var currentBytes = 0
         var acceptedBytes = 0
 
-        for row in stride(from: inspectedBuffer.lines.count - 1, through: 0, by: -1) {
+        for row in stride(from: inspectedBuffer.lines.count - 1, through: floorRow, by: -1) {
             let bufferLine = inspectedBuffer.lines[row]
             let text = bufferLine.translateToString(trimRight: true)
             let bytes = text.utf8.count
@@ -7253,6 +7324,8 @@ open class Terminal {
 
             currentRowsNewestFirst.append(text)
             currentBytes += bytes
+            // Reaching `floorRow` mid-continuation drops the fragment for the same reason a
+            // continuation whose beginning fell out of scrollback is dropped.
             guard !bufferLine.isWrapped else { continue }
 
             logicalLinesNewestFirst.append(currentRowsNewestFirst)
@@ -7261,9 +7334,12 @@ open class Terminal {
             currentBytes = 0
         }
 
-        return logicalLinesNewestFirst.reversed().map { rowsNewestFirst in
-            rowsNewestFirst.reversed().joined()
-        }.joined(separator: "\n")
+        return RecentBufferText(
+            text: logicalLinesNewestFirst.reversed().map { rowsNewestFirst in
+                rowsNewestFirst.reversed().joined()
+            }.joined(separator: "\n"),
+            nextAbsoluteRow: endAbsoluteRow
+        )
     }
     
     /// Returns the text between the specified range
