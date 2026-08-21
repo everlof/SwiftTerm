@@ -252,6 +252,43 @@ final class TerminalRenderOwner: Sendable {
         }
     }
 
+    func recentLogicalBufferText(
+        maximumUTF8Bytes: Int,
+        sinceAbsoluteRow: Int,
+        kind: Terminal.BufferKind
+    ) -> Terminal.RecentBufferText {
+        guard let terminal = currentSession()?.terminal else {
+            return Terminal.RecentBufferText(text: "", nextAbsoluteRow: 0)
+        }
+        return terminal.terminalLock.withLock {
+            terminal.getRecentLogicalBufferText(
+                maximumUTF8Bytes: maximumUTF8Bytes,
+                sinceAbsoluteRow: sinceAbsoluteRow,
+                kind: kind)
+        }
+    }
+
+    func changeHistorySize(_ newScrollback: Int?) {
+        guard let terminal = currentSession()?.terminal else { return }
+        terminal.terminalLock.withLock {
+            terminal.changeHistorySize(newScrollback)
+        }
+    }
+
+    func reportColorSchemeChange(dark: Bool) {
+        guard let terminal = currentSession()?.terminal else { return }
+        terminal.terminalLock.withLock {
+            terminal.reportColorSchemeChange(dark: dark)
+        }
+    }
+
+    func setTerminalFocus(_ focused: Bool) {
+        guard let terminal = currentSession()?.terminal else { return }
+        terminal.terminalLock.withLock {
+            terminal.setTerminalFocus(focused)
+        }
+    }
+
     func stateSnapshot() -> TerminalViewStateSnapshot {
         guard let terminal = currentSession()?.terminal else {
             return TerminalViewStateSnapshot(
@@ -262,6 +299,17 @@ final class TerminalRenderOwner: Sendable {
                 bidiArrowKeySwap: false,
                 cursorStyle: .blinkBlock,
                 ansi256PaletteStrategy: .base16Lab,
+                isAlternateBuffer: false,
+                cursorHidden: false,
+                mouseMode: .off,
+                mouseProtocol: .x10,
+                applicationCursor: false,
+                bracketedPasteMode: false,
+                backgroundColor: Color(red: 0, green: 0, blue: 0),
+                historySize: 0,
+                scrollTop: 0,
+                scrollBottom: 0,
+                userScrolling: false,
                 visibleRows: [])
         }
         return terminal.terminalLock.withLock {
@@ -273,6 +321,13 @@ final class TerminalRenderOwner: Sendable {
                         return nil
                     }
                     let line = buffer.lines[lineIndex]
+                    let cells = (0..<terminal.cols).map { column in
+                        let cell = line[column]
+                        return TerminalVisibleCellSnapshot(
+                            character: cell.getCharacter(),
+                            width: Int(cell.width),
+                            attribute: cell.attribute)
+                    }
                     let text = terminal.translateBufferLineToString(
                         buffer: buffer, line: lineIndex, start: 0, end: -1)
                         .replacingOccurrences(of: "\u{0}", with: " ")
@@ -281,9 +336,8 @@ final class TerminalRenderOwner: Sendable {
                         text: text,
                         isWrapped: line.isWrapped,
                         bidiState: line.bidiState,
-                        cellWidths: (0..<terminal.cols).map {
-                            Int(line[$0].width)
-                        })
+                        cellWidths: cells.map(\.width),
+                        cells: cells)
                 }
                 return TerminalViewStateSnapshot(
                     dimensions: TerminalDimensions(
@@ -294,6 +348,17 @@ final class TerminalRenderOwner: Sendable {
                     bidiArrowKeySwap: terminal.bidiArrowKeySwap,
                     cursorStyle: terminal.options.cursorStyle,
                     ansi256PaletteStrategy: terminal.ansi256PaletteStrategy,
+                    isAlternateBuffer: terminal.isCurrentBufferAlternate,
+                    cursorHidden: terminal.cursorHidden,
+                    mouseMode: terminal.mouseMode,
+                    mouseProtocol: terminal.mouseProtocol,
+                    applicationCursor: terminal.applicationCursor,
+                    bracketedPasteMode: terminal.bracketedPasteMode,
+                    backgroundColor: terminal.backgroundColor,
+                    historySize: terminal.options.scrollback,
+                    scrollTop: buffer.scrollTop,
+                    scrollBottom: buffer.scrollBottom,
+                    userScrolling: terminal.userScrolling,
                     visibleRows: visibleRows)
         }
     }

@@ -217,11 +217,20 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
      * The `processDelegate` is used to deliver messages and information relevant t
      */
     public weak var processDelegate: LocalProcessTerminalViewDelegate?
+
+    /// Gives a subclass a chance to keep the child process on an explicitly
+    /// managed grid. The default preserves SwiftTerm's resize behaviour.
+    open func shouldApplyProcessSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
     
     /**
      * This method is invoked to notify the client of the new columsn and rows that have been set by the UI
      */
     public func sizeChanged(source: TerminalView, newCols: Int, newRows: Int) {
+        guard shouldApplyProcessSizeChange(newCols: newCols, newRows: newRows) else {
+            return
+        }
         var size = getWindowSize()
         processAdapter.updateWindowSize(size)
         guard process.updateWindowSize(&size) else { return }

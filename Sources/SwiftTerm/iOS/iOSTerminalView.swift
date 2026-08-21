@@ -123,6 +123,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      */
     public weak var terminalDelegate: TerminalViewDelegate?
 
+    /// Gives a subclass a chance to keep the emulator on an explicitly
+    /// managed grid when this view's frame changes.
+    open func shouldApplyFrameSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
+    /// Gives a subclass a chance to suppress frame-derived size reports while
+    /// another host owns the authoritative terminal grid.
+    open func shouldReportSizeChange(newCols: Int, newRows: Int) -> Bool {
+        true
+    }
+
     /// Controls how the Metal renderer builds GPU buffers each frame.
     ///
     /// The default is ``MetalBufferingMode/perRowPersistent``, which caches
@@ -1398,6 +1410,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     }
     
     var _nativeFg, _nativeBg: TTColor!
+    var _nativeBoldFg: UIColor?
+
+    /// Rewrites 24-bit background colours on their way to the screen. The
+    /// value-only transformer is safe to use on SwiftTerm's render thread.
+    public var trueColorBackgroundTransform:
+        (any TerminalTrueColorBackgroundTransform)? {
+        didSet { colorsChanged() }
+    }
     var settingFg = false, settingBg = false
     func setNativeForegroundColorLocked (_ newValue: UIColor)
     {
@@ -1454,6 +1474,19 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             withTerminal { _ in
                 setNativeForegroundColorLocked(newValue)
             }
+        }
+    }
+
+    /// The colour for bold text that uses the default foreground, or nil to
+    /// use `nativeForegroundColor`. Explicit ANSI colours are unaffected.
+    public var nativeBoldForegroundColor: UIColor? {
+        get { _nativeBoldFg }
+        set {
+            guard _nativeBoldFg != newValue else { return }
+            _nativeBoldFg = newValue
+            resetCaches()
+            withTerminal { $0.updateFullScreen() }
+            frameDriver.markDirty()
         }
     }
     
