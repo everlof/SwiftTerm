@@ -503,6 +503,9 @@ struct FrameViewState: Sendable {
     let useBrightColors: Bool
     let trueColorBackgroundTransform:
         (any TerminalTrueColorBackgroundTransform)?
+#if os(macOS)
+    let detectsLowContrastText: Bool
+#endif
     let bidiHostPolicy: BidiHostPolicy
     let glyphFallbackProvider: (any TerminalGlyphFallbackProvider)?
 
@@ -541,6 +544,9 @@ struct FrameViewState: Sendable {
         customBlockGlyphs = view.customBlockGlyphs
         useBrightColors = view.useBrightColors
         trueColorBackgroundTransform = view.trueColorBackgroundTransform
+#if os(macOS)
+        detectsLowContrastText = view.onLowContrastText != nil
+#endif
         bidiHostPolicy = view.bidiHostPolicy
         glyphFallbackProvider = view.glyphFallbackProvider
     }
@@ -568,6 +574,7 @@ struct MainFrameEffects: Sendable {
     var resizedTo: FrameTerminalSize? = nil
 #if os(macOS)
     var scroller: TerminalView.ScrollerState? = nil
+    var lowContrastText: [TerminalTextColorConflict] = []
 #endif
 }
 
@@ -1100,11 +1107,12 @@ public final class TerminalInputSender: Sendable {
 
     @MainActor
     func replaceDelivery(
-        _ deliver: @escaping @Sendable ([UInt8]) -> Void
+        _ deliver: @escaping @Sendable ([UInt8]) -> Void,
+        deliverOnMain: @escaping @MainActor @Sendable ([UInt8]) -> Void
     ) {
         state.withLock { state in
             state.deliver = deliver
-            state.deliverOnMain = { bytes in deliver(bytes) }
+            state.deliverOnMain = deliverOnMain
         }
     }
 
@@ -1217,17 +1225,12 @@ extension TerminalView {
     func configureFeedSender() {
         let owner = renderOwner
         let signal = frameSignal
-        let crossThreadState = crossThreadState
         let diagnosticsState = diagnosticsState
         feedSender.configure(
             feedBytes: { bytes in
                 signal.markDirty()
                 let parse = Profiling.begin(.ioParse, "bytes=%d", bytes.count)
-                _ = owner.feed(
-                    bytes: bytes[...],
-                    allowMouseReporting: crossThreadState.withLock {
-                        $0.allowMouseReporting
-                    })
+                _ = owner.feed(bytes: bytes[...])
                 parse.end()
                 diagnosticsState.withLock { diagnostics in
                     diagnostics.bytesFed += bytes.count
@@ -1237,11 +1240,7 @@ extension TerminalView {
             },
             feedText: { text in
                 signal.markDirty()
-                _ = owner.feed(
-                    text: text,
-                    allowMouseReporting: crossThreadState.withLock {
-                        $0.allowMouseReporting
-                    })
+                _ = owner.feed(text: text)
                 diagnosticsState.withLock { diagnostics in
                     diagnostics.bytesFed += text.utf8.count
                     diagnostics.batches += 1
@@ -1436,6 +1435,19 @@ extension TerminalView {
     /// Returns copied terminal state for status displays and diagnostics.
     public nonisolated func terminalStateSnapshot() -> TerminalViewStateSnapshot {
         renderOwner.stateSnapshot()
+    }
+
+    /// Encodes a custom accessory key through SwiftTerm's live keyboard state.
+    public func encodedFunctionalKey(
+        _ key: TerminalFunctionalKey,
+        modifiers: KittyKeyboardModifiers = [],
+        eventType: KittyKeyboardEventType = .press
+    ) -> [UInt8]? {
+        renderOwner.encodedFunctionalKey(
+            key,
+            modifiers: modifiers,
+            eventType: eventType,
+            backspaceSendsControlH: backspaceSendsControlH)
     }
 
     /// Copies terminal buffer contents without exposing the mutable terminal.
@@ -1760,6 +1772,13 @@ extension TerminalView {
         switch color {
         case .defaultColor:
             if isFg {
+                // A host palette may provide Terminal.app's separate "Bold Text"
+                // colour. Explicit ANSI colours still take the bold-to-bright path
+                // below; this applies only to SGR 1 with the default foreground.
+                if isBold, !terminal.reverseColors,
+                   let bold = nativeBoldForegroundColor {
+                    return bold
+                }
                 return effectiveNativeForegroundColor
             } else {
                 return effectiveNativeBackgroundColor
@@ -1798,6 +1817,14 @@ extension TerminalView {
             colors [midx] = newColor
             return newColor
         case .trueColor(let r, let g, let b):
+            if !isFg, let transform = trueColorBackgroundTransform {
+                let rendered = transform.transform(TerminalRenderedColor(
+                    red: r, green: g, blue: b))
+                return TTColor.make(red: CGFloat(rendered.red) / 255,
+                                    green: CGFloat(rendered.green) / 255,
+                                    blue: CGFloat(rendered.blue) / 255,
+                                    alpha: 1)
+            }
             if let tc = trueColors [color] {
                 return tc
             }
@@ -1837,6 +1864,8 @@ extension TerminalView {
         coreGraphicsRenderCache.clearColors()
 
 #if os(macOS)
+        evaluatedTextContrast.removeAll(keepingCapacity: true)
+        reportedTextContrast.removeAll(keepingCapacity: true)
         if !isUsingMetalRenderer {
             layer?.backgroundColor = effectiveNativeBackgroundColor.cgColor
         }
@@ -3512,6 +3541,10 @@ extension TerminalView {
             get { mainEffects.scroller }
             set { mainEffects.scroller = newValue }
         }
+        var lowContrastText: [TerminalTextColorConflict] {
+            get { mainEffects.lowContrastText }
+            set { mainEffects.lowContrastText = newValue }
+        }
 #endif
     }
 
@@ -3585,6 +3618,7 @@ extension TerminalView {
         if let scroller = effects.scroller {
             applyScrollerState(scroller)
         }
+        reportLowContrastText(effects.lowContrastText)
 #endif
         updateTextBlinkLifecycle(blinkRows: effects.blinkRows)
 
@@ -4167,10 +4201,9 @@ extension TerminalView {
     {
         terminal.terminalLock.preconditionLocked()
         search.invalidate()
-        // Preserve manual selection while output is streaming when mouse reporting is disabled.
-        if allowMouseReporting {
-            selection.active = false
-        }
+        // Buffer mutation keeps registered selections aligned with scrolling
+        // and scrollback trimming. Do not discard a user's selection merely
+        // because more output arrived.
     }
     
     func feedFinish (synchronizedOutputActive: Bool)
@@ -4607,6 +4640,33 @@ extension TerminalView {
         }
     }
 
+}
+
+/// Token bucket shared by macOS wheel and iOS finger-to-wheel reporting.
+///
+/// PTYs do not preserve message boundaries. Bounding the report rate prevents a slowly rendering
+/// application from observing fragments of mouse escapes as typed text, while allowing a small
+/// immediate burst for a deliberate gesture.
+public struct WheelReportBudget {
+    public static let reportsPerSecond: Double = 100
+    public static let burst: Double = 6
+
+    private var allowance: Double = WheelReportBudget.burst
+    private var stamp = DispatchTime.now()
+
+    public init() {}
+
+    public mutating func grant(_ wanted: Int) -> Int {
+        let now = DispatchTime.now()
+        let elapsed = Double(now.uptimeNanoseconds &- stamp.uptimeNanoseconds) / 1_000_000_000
+        stamp = now
+        allowance = min(
+            WheelReportBudget.burst,
+            allowance + elapsed * WheelReportBudget.reportsPerSecond)
+        let granted = min(wanted, Int(allowance))
+        allowance -= Double(granted)
+        return granted
+    }
 }
 
 #if canImport(UIKit) && DEBUG

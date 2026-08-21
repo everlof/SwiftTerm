@@ -177,14 +177,11 @@ final class TerminalRenderOwner: Sendable {
     /// Feeds one parser batch while this owner retains all mutable terminal
     /// services. The caller can wake the frame driver before and after this
     /// transaction without retaining a view.
-    func feed (bytes: ArraySlice<UInt8>, allowMouseReporting: Bool) -> Bool? {
+    func feed (bytes: ArraySlice<UInt8>) -> Bool? {
         guard let session = currentSession() else { return nil }
         let terminal = session.terminal
         return terminal.terminalLock.withLock {
             session.search.invalidate()
-            if allowMouseReporting {
-                session.selection.active = false
-            }
             terminal.withManagedFeed {
                 terminal.feed(buffer: bytes)
             }
@@ -194,14 +191,11 @@ final class TerminalRenderOwner: Sendable {
 
     /// Feeds one borrowed parser batch. The parse finishes before this method
     /// returns, so the caller can release the source storage after the call.
-    func feed(borrowedBytes: Span<UInt8>, allowMouseReporting: Bool) -> Bool? {
+    func feed(borrowedBytes: Span<UInt8>) -> Bool? {
         guard let session = currentSession() else { return nil }
         let terminal = session.terminal
         return terminal.terminalLock.withLock {
             session.search.invalidate()
-            if allowMouseReporting {
-                session.selection.active = false
-            }
             terminal.withManagedFeed {
                 terminal.feedBorrowed(borrowedBytes)
             }
@@ -209,15 +203,12 @@ final class TerminalRenderOwner: Sendable {
         }
     }
 
-    /// Text variant of ``feed(bytes:allowMouseReporting:)``.
-    func feed (text: String, allowMouseReporting: Bool) -> Bool? {
+    /// Text variant of ``feed(bytes:)``.
+    func feed (text: String) -> Bool? {
         guard let session = currentSession() else { return nil }
         let terminal = session.terminal
         return terminal.terminalLock.withLock {
             session.search.invalidate()
-            if allowMouseReporting {
-                session.selection.active = false
-            }
             terminal.withManagedFeed {
                 terminal.feed(text: text)
             }
@@ -286,6 +277,22 @@ final class TerminalRenderOwner: Sendable {
         guard let terminal = currentSession()?.terminal else { return }
         terminal.terminalLock.withLock {
             terminal.setTerminalFocus(focused)
+        }
+    }
+
+    func encodedFunctionalKey(
+        _ key: TerminalFunctionalKey,
+        modifiers: KittyKeyboardModifiers,
+        eventType: KittyKeyboardEventType,
+        backspaceSendsControlH: Bool
+    ) -> [UInt8]? {
+        guard let terminal = currentSession()?.terminal else { return nil }
+        return terminal.terminalLock.withLock {
+            terminal.encodedFunctionalKey(
+                key,
+                modifiers: modifiers,
+                eventType: eventType,
+                backspaceSendsControlH: backspaceSendsControlH)
         }
     }
 
@@ -586,6 +593,13 @@ final class TerminalRenderOwner: Sendable {
         let blinkRows = Self.blinkRows(in: session.snapshot)
         mailbox.publishBlinkRows(blinkRows)
         update?.blinkRows = blinkRows
+#if os(macOS)
+        if request.viewState.detectsLowContrastText,
+           let context = session.snapshot.renderContext {
+            update?.lowContrastText = TerminalContrastDetector.detect(
+                snapshot: session.snapshot, context: context)
+        }
+#endif
 #if canImport(MetalKit)
         prepareMetalSnapshot(renderer: renderer, snapshot: session.snapshot)
 #endif

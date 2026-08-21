@@ -98,9 +98,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
     func dataReceived(slice: ArraySlice<UInt8>) {
         frameSignal.markDirty()
         let parse = Profiling.begin(.ioParse, "bytes=%d", slice.count)
-        _ = renderOwner.feed(
-            bytes: slice,
-            allowMouseReporting: crossThreadState.withLock { $0.allowMouseReporting })
+        _ = renderOwner.feed(bytes: slice)
         parse.end()
         diagnosticsState.withLock { diagnostics in
             diagnostics.bytesFed += slice.count
@@ -113,9 +111,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
     func dataReceivedBorrowed(_ bytes: Span<UInt8>) {
         frameSignal.markDirty()
         let parse = Profiling.begin(.ioParse, "bytes=%d", bytes.count)
-        _ = renderOwner.feed(
-            borrowedBytes: bytes,
-            allowMouseReporting: crossThreadState.withLock { $0.allowMouseReporting })
+        _ = renderOwner.feed(borrowedBytes: bytes)
         parse.end()
         diagnosticsState.withLock { diagnostics in
             diagnostics.bytesFed += bytes.count
@@ -200,9 +196,14 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
             dispatchQueue: .main,
             directDelivery: true)
         adapter.attachInputProcess(process)
-        inputSender.replaceDelivery { [adapter] bytes in
-            adapter.sendInput(bytes)
-        }
+        inputSender.replaceDelivery(
+            { [adapter] bytes in
+                adapter.sendInput(bytes)
+            },
+            deliverOnMain: { [weak self] bytes in
+                guard let self else { return }
+                self.terminalDelegate?.send(source: self, data: bytes[...])
+            })
         adapter.updateWindowSize(getWindowSize())
     }
 

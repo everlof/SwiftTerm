@@ -36,6 +36,19 @@ final class EmbeddingIntegrationTests: XCTestCase {
             allocatedBefore)
     }
 
+    func testFunctionalKeyAPIUsesLiveTerminalKeyboardModes() {
+        let terminal = terminal()
+
+        XCTAssertEqual(terminal.encodedFunctionalKey(.up), Array("\u{1b}[A".utf8))
+        terminal.feed(text: "\u{1b}[?1h")
+        XCTAssertEqual(terminal.encodedFunctionalKey(.up), Array("\u{1b}OA".utf8))
+
+        terminal.feed(text: "\u{1b}[>1u")
+        XCTAssertEqual(
+            terminal.encodedFunctionalKey(.tab, modifiers: [.ctrl]),
+            Array("\u{1b}[9;5u".utf8))
+    }
+
     func testAlternateScreenDefersNormalScrollbackReflowUntilReturn() {
         let terminal = terminal(scrollback: 10_000)
         terminal.feed(text: "normal buffer marker")
@@ -147,6 +160,19 @@ final class EmbeddingIntegrationTests: XCTestCase {
         terminal.reportColorSchemeChange(dark: true)
         XCTAssertTrue(delegate.text.contains("\u{1b}[?997;1n"))
     }
+
+    func testDiagnosticsAreStructuredAndRateLimited() {
+        let events = DiagnosticEvents()
+        SwiftTermDiagnostics.installHandler { events.append($0) }
+        addTeardownBlock { SwiftTermDiagnostics.removeHandler() }
+
+        SwiftTermDiagnostics.emit(.error, .ptyWriteFailed, facts: ["errno": 5])
+        SwiftTermDiagnostics.emit(.error, .ptyWriteFailed, facts: ["errno": 6])
+        SwiftTermDiagnostics.emit(.fault, .bufferWidthInvariant, facts: ["columns": 80])
+
+        XCTAssertEqual(events.snapshot.map(\.code), [.ptyWriteFailed, .bufferWidthInvariant])
+        XCTAssertEqual(events.snapshot.first?.facts, ["errno": 5])
+    }
 }
 
 private final class CapturingTerminalDelegate: TerminalDelegate {
@@ -155,6 +181,23 @@ private final class CapturingTerminalDelegate: TerminalDelegate {
 
     func send(source: Terminal, data: ArraySlice<UInt8>) {
         self.data.append(contentsOf: data)
+    }
+}
+
+private final class DiagnosticEvents: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [SwiftTermDiagnosticEvent] = []
+
+    func append(_ event: SwiftTermDiagnosticEvent) {
+        lock.lock()
+        storage.append(event)
+        lock.unlock()
+    }
+
+    var snapshot: [SwiftTermDiagnosticEvent] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage
     }
 }
 #endif

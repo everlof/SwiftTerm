@@ -58,6 +58,7 @@ final class LocalProcessLifecycleTests: XCTestCase {
             environment: nil,
             execName: "sleep")
         let firstPID = process.shellPid
+        XCTAssertEqual(kill(firstPID, SIGSTOP), 0)
         process.terminate()
         process.startProcess(
             executable: "/usr/bin/true",
@@ -65,6 +66,7 @@ final class LocalProcessLifecycleTests: XCTestCase {
             execName: "true")
 
         XCTAssertEqual(process.shellPid, firstPID)
+        XCTAssertEqual(kill(firstPID, SIGCONT), 0)
         wait(for: [firstTermination], timeout: 5)
         XCTAssertEqual(kill(firstPID, 0), -1)
         XCTAssertEqual(errno, ESRCH)

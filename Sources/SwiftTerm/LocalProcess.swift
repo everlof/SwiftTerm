@@ -241,7 +241,10 @@ public class LocalProcess {
             let ddata = DispatchData(bytes: ptr)
             let copyCount = ddata.count
             if sendState.debug {
-                print ("[SEND-\(copy)] Queuing data to client: \(data) ")
+                SwiftTermDiagnostics.emit(
+                    .debug,
+                    .ptyWriteQueued,
+                    facts: ["sequence": copy, "byteCount": copyCount])
             }
 
             sendState.channel.write(offset: 0, data: ddata, queue: writeQueue, ioHandler: { done, _, errno in
@@ -251,11 +254,17 @@ public class LocalProcess {
                         return counters.totalWritten
                     }
                     if session.withLock({ $0.debugIO }) {
-                        print ("[SEND-\(copy)] completed bytes=\(written)")
+                        SwiftTermDiagnostics.emit(
+                            .debug,
+                            .ptyWriteCompleted,
+                            facts: ["sequence": copy, "totalByteCount": written])
                     }
                 }
                 if errno != 0 {
-                    print ("Error writing data to the child, errno=\(errno)")
+                    SwiftTermDiagnostics.emit(
+                        .error,
+                        .ptyWriteFailed,
+                        facts: ["errno": Int(errno), "byteCount": copyCount])
                 }
             })
         }
@@ -720,7 +729,10 @@ extension LocalProcess: TerminalIOPipelineDelegate {
         }
         guard let delivery else { return }
         if let debugTotal = delivery.debugTotal {
-            print("[READ] count=\(data.count) received from host total=\(debugTotal)")
+            SwiftTermDiagnostics.emit(
+                .debug,
+                .ptyReadCompleted,
+                facts: ["byteCount": data.count, "totalByteCount": debugTotal])
         }
 
         if let path = delivery.logPath {
@@ -728,7 +740,7 @@ extension LocalProcess: TerminalIOPipelineDelegate {
             do {
                 try ownedData.write(to: URL(fileURLWithPath: path))
             } catch {
-                print("Got error while logging data dump to \(path): \(error)")
+                SwiftTermDiagnostics.emit(.warning, .ptyDataDumpFailed)
             }
         }
 
