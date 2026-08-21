@@ -1014,6 +1014,7 @@ public struct TerminalViewStateSnapshot: Sendable {
     public let mouseProtocol: Terminal.MouseProtocolEncoding
     public let applicationCursor: Bool
     public let bracketedPasteMode: Bool
+    public let keyboardEnhancementFlags: KittyKeyboardFlags
     public let backgroundColor: Color
     public let historySize: Int
     public let scrollTop: Int
