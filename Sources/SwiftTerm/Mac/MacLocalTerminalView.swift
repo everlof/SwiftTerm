@@ -56,7 +56,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
     private let crossThreadState: Locked<TerminalViewCrossThreadState>
     private let diagnosticsState: Locked<TerminalView.Diagnostics>
     private let outputHandler: LockedVoidCallback
-    private let outputBytesHandler: Locked<(@Sendable ([UInt8]) -> Void)?>
+    private let outputBytesHandler: LockedBytesCallback
     private let windowSize = Locked(winsize())
     private let inputProcess = Locked(WeakLocalProcessInputReference())
     private let terminationHandler: @MainActor @Sendable (Int32?) -> Void
@@ -66,7 +66,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
          crossThreadState: Locked<TerminalViewCrossThreadState>,
          diagnosticsState: Locked<TerminalView.Diagnostics>,
          outputHandler: LockedVoidCallback,
-         outputBytesHandler: Locked<(@Sendable ([UInt8]) -> Void)?>,
+         outputBytesHandler: LockedBytesCallback,
          terminationHandler: @escaping @MainActor @Sendable (Int32?) -> Void) {
         self.renderOwner = renderOwner
         self.frameSignal = frameSignal
@@ -108,7 +108,7 @@ private final class LocalProcessTerminalViewProcessAdapter:
             diagnostics.batches += 1
         }
         outputHandler.call()
-        outputBytesHandler.withLock { $0 }?(Array(slice))
+        outputBytesHandler.call(slice: slice)
         frameSignal.markDirty()
     }
 
@@ -122,11 +122,9 @@ private final class LocalProcessTerminalViewProcessAdapter:
             diagnostics.batches += 1
         }
         outputHandler.call()
-        if let handler = outputBytesHandler.withLock({ $0 }) {
-            // The IO pipeline reuses its storage as soon as this delegate returns. Copy only
-            // when a host installed the byte observer, and hand that observer owned bytes.
-            handler(bytes.copiedBytes())
-        }
+        // The callback container copies only when a host installed an observer. The IO pipeline
+        // can therefore reuse its borrowed storage as soon as this delegate returns.
+        outputBytesHandler.call(borrowed: bytes)
         frameSignal.markDirty()
     }
 
@@ -164,8 +162,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     public internal(set) var process: LocalProcess!
     private var processAdapter: LocalProcessTerminalViewProcessAdapter!
     nonisolated private let processOutputHandler = LockedVoidCallback()
-    nonisolated private let processOutputBytesHandler =
-        Locked<(@Sendable ([UInt8]) -> Void)?>(nil)
+    nonisolated private let processOutputBytesHandler = LockedBytesCallback()
 
     public override init (frame: CGRect)
     {
@@ -238,7 +235,7 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
     public func setProcessOutputBytesHandler(
         _ handler: (@Sendable ([UInt8]) -> Void)?
     ) {
-        processOutputBytesHandler.withLock { $0 = handler }
+        processOutputBytesHandler.replace(with: handler)
     }
     
     /**
