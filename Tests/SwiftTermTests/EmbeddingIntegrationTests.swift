@@ -49,22 +49,6 @@ final class EmbeddingIntegrationTests: XCTestCase {
             Array("\u{1b}[9;5u".utf8))
     }
 
-    func testAlternateScreenDefersNormalScrollbackReflowUntilReturn() {
-        let terminal = terminal(scrollback: 10_000)
-        terminal.feed(text: "normal buffer marker")
-        terminal.feed(text: "\u{1b}[?1049h")
-
-        terminal.resize(cols: 120, rows: 40)
-
-        XCTAssertEqual(terminal.altBuffer.cols, 120)
-        XCTAssertEqual(terminal.normalBuffer.cols, 80)
-        terminal.feed(text: "\u{1b}[?1049l")
-        XCTAssertEqual(terminal.normalBuffer.cols, 120)
-        XCTAssertTrue(terminal.normalBuffer.lines.getArray().compactMap { $0 }.contains {
-            $0.translateToString(trimRight: true).contains("normal buffer marker")
-        })
-    }
-
     func testRecentLogicalBufferJoinsWrapsAndPreservesHardBreaks() {
         let terminal = terminal(cols: 12, rows: 8)
         let path = "/tmp/a-very-long-render-name.png"

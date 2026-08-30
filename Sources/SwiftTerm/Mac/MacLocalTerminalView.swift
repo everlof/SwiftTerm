@@ -240,12 +240,49 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
      */
     public weak var processDelegate: LocalProcessTerminalViewDelegate?
 
+    /// Delivers a parser bell after `TerminalView` has marshalled it onto the main actor.
+    ///
+    /// Declared here instead of relying on `TerminalViewDelegate`'s protocol-extension default
+    /// so a host subclass can override the delivery without intercepting
+    /// `TerminalDelegate.bell(source: Terminal)`. That lower callback runs on the parse thread
+    /// while `TerminalLock` is held; host work there can invert the terminal lock with the main
+    /// queue. The inherited parser callback must remain the event-queue producer, and this method
+    /// is the host customization seam at its main-actor consumer.
+    open func bell(source: TerminalView) {
+        NSSound.beep()
+    }
+
     /// Gives a subclass a chance to keep the child process on an explicitly
     /// managed grid. The default preserves SwiftTerm's resize behaviour.
     open func shouldApplyProcessSizeChange(newCols: Int, newRows: Int) -> Bool {
         true
     }
-    
+
+    /// Delivers the window size to whatever owns this terminal's child, answering
+    /// whether it was delivered.
+    ///
+    /// The default is SwiftTerm's own behaviour: apply it to the pty this view
+    /// opened, which answers false when there is no running child to apply it to.
+    /// The seam exists for a host whose child lives in another process — it has no
+    /// `LocalProcess` to update and has to send the size somewhere else — and it is
+    /// deliberately shaped like `shouldApplyProcessSizeChange` beside it, because
+    /// `sizeChanged` is a protocol requirement and therefore cannot be overridden.
+    /// `winsize` is passed whole rather than as columns and rows: a program that
+    /// asks for pixel dimensions gets zeroes if they are dropped in transit.
+    ///
+    /// **The contract is "this grid will reach the child", not "the bytes have
+    /// left".** The default is a synchronous `ioctl` on a descriptor this process
+    /// holds, where the two are the same thing and neither can fail once the
+    /// emulator has already resized. An out-of-process host answers over a socket,
+    /// where a write can be refused and a session may not exist yet, so it returns
+    /// true for a grid it has recorded and undertaken to converge on, and false only
+    /// when there is no host left to converge — which is the answer `sizeChanged`
+    /// needs, since it uses it to decide whether the resize is worth reporting to
+    /// `processDelegate` at all.
+    open func sendWindowSize(_ size: inout winsize) -> Bool {
+        process.updateWindowSize(&size)
+    }
+
     /**
      * This method is invoked to notify the client of the new columsn and rows that have been set by the UI
      */
@@ -255,8 +292,8 @@ open class LocalProcessTerminalView: TerminalView, TerminalViewDelegate {
         }
         var size = getWindowSize()
         processAdapter.updateWindowSize(size)
-        guard process.updateWindowSize(&size) else { return }
-        
+        guard sendWindowSize(&size) else { return }
+
         processDelegate?.sizeChanged (source: self, newCols: newCols, newRows: newRows)
     }
     

@@ -650,19 +650,6 @@ private final class TerminatingLocalProcessCapture: LocalProcessDelegate {
         condition.unlock()
         return true
     }
-
-    func waitForTermination(timeout: TimeInterval) -> Bool {
-        let limit = Date().addingTimeInterval(timeout)
-        condition.lock()
-        while !terminated {
-            if !condition.wait(until: limit) {
-                condition.unlock()
-                return false
-            }
-        }
-        condition.unlock()
-        return true
-    }
 }
 
 private final class PipelineCapture: TerminalIOPipelineDelegate {
