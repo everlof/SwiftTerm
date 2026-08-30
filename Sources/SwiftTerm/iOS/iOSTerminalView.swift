@@ -158,15 +158,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
      * If a client application has not indicated any use for mouse events, then this setting
      * does not do anything, and selection and panning are still processed.
      */
-    public var allowMouseReporting: Bool = true {
-        didSet {
-            crossThreadState.withLock { $0.allowMouseReporting = allowMouseReporting }
-            guard allowMouseReporting != oldValue, terminal != nil else { return }
-            // A host that declines reports must get one-finger scrolling back
-            // even when the application still has mouse tracking enabled.
-            refreshProgramScrollGesture(mouseMode: terminalStateSnapshot().mouseMode)
-        }
-    }
+    public var allowMouseReporting: Bool = true
 
     /// Controls how link tracking resolves hovered links:
     /// `.explicit` = OSC 8 only, `.implicit` = explicit + implicit fallback, `.none` = off.
@@ -226,6 +218,11 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var search: SearchService!
     var debug: UIView?
     let viewStateLock = NSLock()
+    /// Cropped bitmaps for the Kitty placements on screen, reused between
+    /// repaints. Building a crop copies the visible pixels and makes a new
+    /// image, which is far too expensive to repeat on every frame - a cursor
+    /// blink alone would rebuild every placement.
+    nonisolated let kittyPlacementImageCache = Locked([KittyPlacementImageKey: TTImage]())
     nonisolated let crossThreadState = Locked(TerminalViewCrossThreadState())
     nonisolated let frameSignal = FrameDriverSignal()
     public nonisolated let inputSender = TerminalInputSender()
@@ -1996,8 +1993,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     /// line-feed event.
     @available(*, deprecated, message: "Use notifyUpdateChanges and TerminalViewDelegate.rangeChanged(source:startY:endY:) for display updates, or use a separate Terminal(delegate:) for each line-feed event.")
     nonisolated open func linefeed(source: Terminal) {
-        // SelectionService adjusts registered selections when the buffer
-        // scrolls or trims, so ordinary output does not invalidate them.
+        // Terminal scroll operations update or clear the selection as necessary.
     }
     
     func updateScroller ()
@@ -2309,7 +2305,13 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         true
     }
     
-    public var hasText: Bool {
+    /// Whether the delete key has anything to act on.
+    ///
+    /// `open` rather than `public` because the answer belongs to the embedder: this
+    /// reports the input-session shadow, which is empty at an ordinary shell prompt,
+    /// while `deleteBackward()` — already `open` — sends a backspace in that same state.
+    /// A host that knows its far side always has something to delete can say so.
+    open var hasText: Bool {
         return !textInputStorage.isEmpty
     }
 

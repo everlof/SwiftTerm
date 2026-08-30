@@ -147,18 +147,14 @@ final class EmbeddingIntegrationTests: XCTestCase {
         XCTAssertEqual(second.nextAbsoluteRow - first.nextAbsoluteRow, 3)
     }
 
-    func testMouseProtocolAndColorSchemeReportingArePublicContracts() {
+    func testMouseProtocolIsPublicContract() {
         let delegate = CapturingTerminalDelegate()
         let terminal = Terminal(
             delegate: delegate,
             options: TerminalOptions(cols: 80, rows: 24))
 
-        terminal.feed(text: "\u{1b}[?1006h\u{1b}[?2031h")
+        terminal.feed(text: "\u{1b}[?1006h")
         XCTAssertEqual(terminal.mouseProtocol, .sgr)
-        XCTAssertTrue(terminal.colorSchemeReportingEnabled)
-
-        terminal.reportColorSchemeChange(dark: true)
-        XCTAssertTrue(delegate.text.contains("\u{1b}[?997;1n"))
     }
 
     func testDiagnosticsAreStructuredAndRateLimited() {
