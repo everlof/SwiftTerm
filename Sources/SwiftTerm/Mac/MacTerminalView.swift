@@ -3927,7 +3927,16 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     /// Leftover fractional trackpad scroll (in points) carried between events so
     /// sub-cell precise deltas accumulate instead of being dropped.
     private var scrollAccumulator: CGFloat = 0
-    private var wheelBudget = WheelReportBudget()
+    private var wheelReportBudget = WheelReportBudget()
+
+    /// Why this wheel event belongs to SwiftTerm. Keeping bypass and alternate-scroll decisions
+    /// distinct prevents a modifier intended for local handling from becoming cursor-key input.
+    private enum WheelRoute: String {
+        case mouse
+        case cursorKeys
+        case localScrollback
+        case none
+    }
 
     /// Multiplier applied to wheel/trackpad scroll deltas. `1.0` scrolls at the
     /// system's native rate; values below `1.0` slow scrolling down, above speed
@@ -3951,27 +3960,26 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             return
         }
 
-        let scrollRouting = withTerminal { terminal in
-            let reportsMouse = allowMouseReporting &&
-                !shiftBypassesMouseReportingLocked(for: event) &&
-                !event.modifierFlags.contains(.option) &&
-                terminal.mouseMode != .off
-            return (
-                reportsMouse: reportsMouse,
-                isAlternate: terminal.isDisplayBufferAlternate,
-                alternateScrollMode: terminal.alternateScrollMode
-            )
+        let scrollRoute = withTerminal { terminal -> WheelRoute in
+            let requestsLocalHandling =
+                shiftBypassesMouseReportingLocked(for: event) ||
+                event.modifierFlags.contains(.option)
+            if requestsLocalHandling {
+                return terminal.isDisplayBufferAlternate ? .none : .localScrollback
+            }
+            if allowMouseReporting && terminal.mouseMode != .off {
+                return .mouse
+            }
+            if terminal.isDisplayBufferAlternate {
+                return terminal.alternateScrollMode ? .cursorKeys : .none
+            }
+            return .localScrollback
         }
 
-        // Alternate Scroll Mode (DECSET 1007): while the alternate screen is
-        // active and the application is not tracking the mouse, the wheel is
-        // translated into cursor keys below. With the mode reset the wheel
-        // produces nothing at all — the alternate buffer has no scrollback to
-        // move either. Decided here, before the accumulator is touched, so that
-        // suppressed motion is not banked and then handed to the first event
-        // after the mode comes back.
-        if !scrollRouting.reportsMouse && scrollRouting.isAlternate &&
-            !scrollRouting.alternateScrollMode {
+        // A suppressed event must not bank a partial trackpad row and hand it to a later route.
+        // This includes Alternate Scroll Mode being reset and a local-handling modifier being
+        // held over the alternate buffer, which has no local scrollback.
+        if scrollRoute == .none {
             scrollAccumulator = 0
             return
         }
@@ -4003,15 +4011,14 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                       event.hasPreciseScrollingDeltas.description,
                       event.isDirectionInvertedFromDevice.description,
                       scrollAccumulator,
-                      scrollRouting.reportsMouse ? "mouse" :
-                        (scrollRouting.isAlternate ? "alternate" : "scrollback"))
+                      scrollRoute.rawValue)
             }
             return
         }
         let scrollingUp = lines > 0
         let magnitude = abs(lines)
 
-        if scrollRouting.reportsMouse {
+        if scrollRoute == .mouse {
             let hit = calculateMouseHit(with: event)
             // AppKit has already applied the system scroll-direction setting to
             // scrollingDeltaY. Preserve that sign, as Ghostty does, when the
@@ -4032,15 +4039,16 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 let screenRow = max(0, min(displayBuffer.rows - 1, hit.grid.row - displayBuffer.yDisp))
                 let buttonFlags = terminal.encodeButton(button: button, release: false,
                                                         shift: flags.contains(.shift), meta: flags.contains(.option), control: flags.contains(.control))
-                let wantedReports = event.hasPreciseScrollingDeltas ? magnitude : 1
-                let reports = wheelBudget.grant(
-                    min(wantedReports, Int(WheelReportBudget.burst)))
+                let wantedReports = WheelReportBudget.requestedReports(
+                    lineCount: lines,
+                    isPrecise: event.hasPreciseScrollingDeltas)
+                let reports = wheelReportBudget.grant(wantedReports)
                 for _ in 0..<reports {
                     terminal.sendEvent(buttonFlags: buttonFlags, x: hit.grid.col, y: screenRow,
                                        pixelX: hit.pixels.col, pixelY: hit.pixels.row)
                 }
             }
-        } else if scrollRouting.isAlternate {
+        } else if scrollRoute == .cursorKeys {
             if Self.logsMouseInput {
                 NSLog("SwiftTerm mouse scroll: deltaY=%g scrollingDeltaY=%g precise=%@ inverted=%@ accumulated=%g lines=%ld route=alternate key=%@",
                       event.deltaY, event.scrollingDeltaY,
@@ -4048,7 +4056,11 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                       event.isDirectionInvertedFromDevice.description,
                       scrollAccumulator, lines, scrollingUp ? "up" : "down")
             }
-            for _ in 0..<magnitude {
+            // A full-screen application executes each arrow key on its own, so a flick that
+            // banked a hundred lines must not become a hundred keystrokes in one event.
+            let keys = wheelReportBudget.grant(
+                WheelReportBudget.requestedKeys(lineCount: lines))
+            for _ in 0..<keys {
                 if scrollingUp {
                     sendKeyUp()
                 } else {

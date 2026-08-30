@@ -4636,30 +4636,107 @@ extension TerminalView {
 
 }
 
-/// Token bucket shared by macOS wheel and iOS finger-to-wheel reporting.
+/// Token bucket shared by macOS wheel and iOS finger-to-wheel reporting, and by the cursor keys
+/// Alternate Scroll Mode generates in their place.
 ///
-/// PTYs do not preserve message boundaries. Bounding the report rate prevents a slowly rendering
-/// application from observing fragments of mouse escapes as typed text, while allowing a small
-/// immediate burst for a deliberate gesture.
-public struct WheelReportBudget {
-    public static let reportsPerSecond: Double = 100
-    public static let burst: Double = 6
+/// Accelerated gestures can represent hundreds of lines in one event. Bounding generated input
+/// keeps a slow terminal application from being overwhelmed while preserving a small immediate
+/// burst for a deliberate gesture.
+struct WheelReportBudget {
+    static let reportsPerSecond: Double = 100
+    static let burst = 6
 
-    private var allowance: Double = WheelReportBudget.burst
-    private var stamp = DispatchTime.now()
+    private var allowance: Double = Double(Self.burst)
+    private var stampNanoseconds: UInt64
 
-    public init() {}
+    init(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+        stampNanoseconds = nowNanoseconds
+    }
 
-    public mutating func grant(_ wanted: Int) -> Int {
-        let now = DispatchTime.now()
-        let elapsed = Double(now.uptimeNanoseconds &- stamp.uptimeNanoseconds) / 1_000_000_000
-        stamp = now
+    /// A classic wheel event is one notch however far acceleration says it travelled, because a
+    /// mouse report is a notch and the application chooses how far a notch scrolls.
+    static func requestedReports(lineCount: Int, isPrecise: Bool) -> Int {
+        guard lineCount != 0 else { return 0 }
+        return isPrecise ? requestedKeys(lineCount: lineCount) : 1
+    }
+
+    /// A cursor key carries its own distance, so an accelerated event keeps its line count up to
+    /// the burst and only the rate is bounded.
+    static func requestedKeys(lineCount: Int) -> Int {
+        Int(min(lineCount.magnitude, UInt(burst)))
+    }
+
+    mutating func grant(
+        _ wanted: Int,
+        nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
+    ) -> Int {
+        guard wanted > 0 else { return 0 }
+        let elapsedNanoseconds: UInt64
+        if nowNanoseconds >= stampNanoseconds {
+            elapsedNanoseconds = nowNanoseconds - stampNanoseconds
+            stampNanoseconds = nowNanoseconds
+        } else {
+            elapsedNanoseconds = 0
+        }
+        let elapsed = Double(elapsedNanoseconds) / 1_000_000_000
         allowance = min(
-            WheelReportBudget.burst,
-            allowance + elapsed * WheelReportBudget.reportsPerSecond)
+            Double(Self.burst),
+            allowance + elapsed * Self.reportsPerSecond)
         let granted = min(wanted, Int(allowance))
         allowance -= Double(granted)
         return granted
+    }
+}
+
+/// Fractional finger travel retained only within one drag gesture.
+struct WheelDragDistanceAccumulator {
+    private var remainder: CGFloat = 0
+
+    mutating func reset() {
+        remainder = 0
+    }
+
+    mutating func takeWholeLines(distance: CGFloat, cellHeight: CGFloat) -> Int {
+        guard cellHeight > 0 else { return 0 }
+        remainder += distance
+        let lines = Int(remainder / cellHeight)
+        remainder -= CGFloat(lines) * cellHeight
+        return lines
+    }
+}
+
+enum ProgramScrollRoute: Equatable {
+    case mouse
+    case cursorKeys
+    case none
+}
+
+struct ProgramScrollRouting {
+    static func route(
+        allowMouseReporting: Bool,
+        shiftBypassesMouseReporting: Bool,
+        mouseTracking: Bool,
+        alternateBuffer: Bool,
+        alternateScrollMode: Bool
+    ) -> ProgramScrollRoute {
+        guard allowMouseReporting, !shiftBypassesMouseReporting else { return .none }
+        if mouseTracking {
+            return .mouse
+        }
+        if alternateBuffer && alternateScrollMode {
+            return .cursorKeys
+        }
+        return .none
+    }
+
+    /// An alternate buffer is captured even when Alternate Scroll Mode is reset. It has no local
+    /// scrollback, so allowing UIScrollView to pan it only exposes empty space.
+    static func capturesGesture(
+        allowMouseReporting: Bool,
+        mouseTracking: Bool,
+        alternateBuffer: Bool
+    ) -> Bool {
+        allowMouseReporting && (mouseTracking || alternateBuffer)
     }
 }
 
