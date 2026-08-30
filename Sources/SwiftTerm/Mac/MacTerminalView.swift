@@ -3973,7 +3973,10 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     private static let logsMouseInput =
         ProcessInfo.processInfo.environment["SWIFTTERM_MOUSE_LOG"] == "1"
 
-    public override func scrollWheel(with event: NSEvent) {
+    /// Routes wheel input between application reporting, alternate-screen cursor keys,
+    /// and local scrollback. Open so embedding terminal subclasses can apply host input policy
+    /// around the route while retaining SwiftTerm's implementation.
+    open override func scrollWheel(with event: NSEvent) {
         // Preserves the previous `deltaY == 0` early exit, restated against the
         // delta this method now reads. Without it a zero delta would fall into
         // the non-precise branch below and be turned into a spurious -1 line.
