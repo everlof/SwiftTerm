@@ -1262,7 +1262,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     /// Reports whole-cell drag distance as bounded wheel presses, or as cursor keys when an
     /// alternate-screen application relies on Alternate Scroll Mode instead of mouse tracking.
-    func forwardWheelDrag(
+    public func forwardWheelDrag(
         distance: CGFloat,
         gestureRecognizer: UIGestureRecognizer
     ) {

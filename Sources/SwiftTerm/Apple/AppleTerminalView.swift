@@ -4655,14 +4655,14 @@ extension TerminalView {
 /// Accelerated gestures can represent hundreds of lines in one event. Bounding generated input
 /// keeps a slow terminal application from being overwhelmed while preserving a small immediate
 /// burst for a deliberate gesture.
-struct WheelReportBudget {
-    static let reportsPerSecond: Double = 100
-    static let burst = 6
+public struct WheelReportBudget {
+    public static let reportsPerSecond: Double = 100
+    public static let burst = 6
 
     private var allowance: Double = Double(Self.burst)
     private var stampNanoseconds: UInt64
 
-    init(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
+    public init(nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds) {
         stampNanoseconds = nowNanoseconds
     }
 
@@ -4679,7 +4679,7 @@ struct WheelReportBudget {
         Int(min(lineCount.magnitude, UInt(burst)))
     }
 
-    mutating func grant(
+    public mutating func grant(
         _ wanted: Int,
         nowNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) -> Int {
